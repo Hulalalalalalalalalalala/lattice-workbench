@@ -9,9 +9,74 @@ The baseline intentionally uses only Node.js built-ins so it is easy to run, ins
 ```bash
 npm test
 npm run demo
+node src/cli.js serve <snapshot> [--port <port>]
 ```
 
 The demo creates an in-memory workspace, adds linked notes, searches their content, and prints a JSON summary. Product data is not sent to an external service.
+
+## Local content service
+
+`serve` exposes a snapshot file over a local HTTP API so an editor can read and
+write documents, with writes persisted to disk and surviving restarts.
+
+```bash
+node src/cli.js serve notes.json --port 3000
+```
+
+- Listens on `127.0.0.1`; the default port is `3000` and `--port 0` binds an
+  ephemeral port.
+- On success, standard output contains exactly one JSON line with the actual
+  address, e.g. `{"host":"127.0.0.1","port":3000,"url":"http://127.0.0.1:3000"}`.
+- If the snapshot file does not exist, the service starts from an empty
+  workspace; the file is created only on the first successful write.
+- If the file exists but cannot be read or fails checksum validation, the
+  process exits with status `1`, writes one JSON error line to standard
+  error, and does not overwrite the file.
+
+### HTTP API
+
+| Method | Path | Description |
+| --- | --- | --- |
+| `GET` | `/documents` | List documents |
+| `GET` | `/documents/:id` | Read one document |
+| `POST` | `/documents` | Create a document |
+| `PUT` | `/documents/:id` | Replace a document |
+| `DELETE` | `/documents/:id` | Delete a document |
+| `GET` | `/search?q=...` | Search titles, bodies, and tags |
+| `GET` | `/documents/:id/links` | Outgoing and incoming wiki-links |
+
+- `POST` and `PUT` bodies are complete documents (`id`, `title`, `body`,
+  `tags`). A path id that differs from the body id returns `400`.
+- Reading, replacing, or deleting a missing document returns `404`.
+- Duplicate ids, or titles that match after trimming (case-sensitive), return
+  `409`. Tags are normalized; bodies are stored verbatim.
+- Writes return `201` (create) or `200` (replace/delete) with the post-commit
+  snapshot and its `ETag` header.
+
+### Optimistic concurrency
+
+Read responses carry an `ETag` header whose value is the current workspace
+checksum in double quotes. Every write must carry an `If-Match` header with
+the same format:
+
+- Missing `If-Match` → `428` `IF_MATCH_REQUIRED`
+- Malformed `If-Match` → `400` `INVALID_IF_MATCH`
+- Stale checksum → `412` `CHECKSUM_MISMATCH`
+
+Writes are serialized: of two concurrent writes sharing a checksum, only the
+first to commit succeeds; the rest get `412`. Reads always see a complete
+pre- or post-commit state.
+
+### Persistence
+
+A write is acknowledged only after the version-1 snapshot has been written to
+disk atomically. If the save fails, the response is `500` `IO_ERROR`, the
+in-memory workspace, query results, and the original file are unchanged, and
+the service keeps accepting requests. Deleting a document leaves `[[links]]`
+in other documents' bodies untouched; links and search reflect commits
+immediately. Request bodies over 1 MiB return `413`; invalid JSON or document
+fields return `400`. All error responses carry a stable `code` and never
+change content.
 
 ## Current contract
 

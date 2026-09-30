@@ -45,7 +45,7 @@ function hashDocuments(documents) {
   return crypto.createHash('sha256').update(payload, 'utf8').digest('hex');
 }
 
-function buildSnapshot(documents) {
+export function buildSnapshot(documents) {
   const canonical = [...documents]
     .map((document) => ({
       id: document.id,

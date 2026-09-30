@@ -2,6 +2,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { SnapshotError, Workspace } from './workspace.js';
+import { loadWorkspace, startServer } from './server.js';
 
 function demo() {
   const workspace = new Workspace();
@@ -74,6 +75,42 @@ function migrate(args) {
   process.stdout.write(rendered);
 }
 
+function parseServeArgs(args) {
+  const positionals = [];
+  let port = 3000;
+  for (let i = 0; i < args.length; i += 1) {
+    const arg = args[i];
+    if (arg === '--port') {
+      const value = args[i + 1];
+      if (value === undefined || value.startsWith('--')) {
+        throw new SnapshotError('INVALID_OPTIONS', '--port requires a value');
+      }
+      const parsed = Number(value);
+      if (!Number.isInteger(parsed) || parsed < 0 || parsed > 65535) {
+        throw new SnapshotError('INVALID_OPTIONS', `invalid port: ${value}`);
+      }
+      port = parsed;
+      i += 1;
+    } else if (arg.startsWith('--')) {
+      throw new SnapshotError('INVALID_OPTIONS', `unknown option: ${arg}`);
+    } else {
+      positionals.push(arg);
+    }
+  }
+  if (positionals.length !== 1) {
+    throw new SnapshotError('INVALID_OPTIONS', 'usage: serve <snapshot> [--port <port>]');
+  }
+  return { snapshot: positionals[0], port };
+}
+
+async function serve(args) {
+  const { snapshot, port } = parseServeArgs(args);
+  const workspace = loadWorkspace(snapshot);
+  const address = await startServer({ workspace, file: snapshot, port });
+  const location = { host: address.host, port: address.port, url: `http://${address.host}:${address.port}` };
+  process.stdout.write(`${JSON.stringify(location)}\n`);
+}
+
 function reportError(error) {
   const payload = { code: error instanceof SnapshotError ? error.code : 'IO_ERROR' };
   if (typeof error.message === 'string') payload.message = error.message;
@@ -91,7 +128,9 @@ if (command === 'demo') {
   } catch (error) {
     reportError(error);
   }
+} else if (command === 'serve') {
+  serve(process.argv.slice(3)).catch((error) => reportError(error));
 } else {
-  process.stderr.write('Usage: node src/cli.js demo | node src/cli.js migrate <base> <incoming> <output> <mode> [--dry-run]\n');
+  process.stderr.write('Usage: node src/cli.js demo | node src/cli.js migrate <base> <incoming> <output> <mode> [--dry-run] | node src/cli.js serve <snapshot> [--port <port>]\n');
   process.exitCode = 1;
 }
