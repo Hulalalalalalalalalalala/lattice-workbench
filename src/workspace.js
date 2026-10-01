@@ -10,6 +10,39 @@ export function normalizeTags(tags) {
   return [...new Set(tags.map((tag) => String(tag).trim().toLowerCase()).filter(Boolean))].sort();
 }
 
+// Counts the existing documents that carry each tag. Returns { tag, count }
+// pairs sorted by tag in Unicode code-point order; an empty document set
+// yields an empty array.
+export function tagCounts(documents) {
+  const counts = new Map();
+  for (const document of documents) {
+    for (const tag of document.tags) counts.set(tag, (counts.get(tag) ?? 0) + 1);
+  }
+  return [...counts.entries()]
+    .map(([tag, count]) => ({ tag, count }))
+    .sort((a, b) => compareCodePoints(a.tag, b.tag));
+}
+
+// Applies a simultaneous tag rewrite to one document's tags. Every tag
+// present in `rules` (a Map of normalized source tag -> normalized target tag,
+// or `null` to remove) is mapped to its target; tags absent from the rules are
+// kept. A produced tag is never re-rewritten, so the rules compose as a
+// simultaneous mapping (a->b and b->c turn an original a into b and an
+// original b into c, rather than chaining a through to c). Returns sorted,
+// deduplicated normalized tags.
+export function rewriteTagsIn(tags, rules) {
+  const next = [];
+  for (const tag of tags) {
+    if (rules.has(tag)) {
+      const target = rules.get(tag);
+      if (target !== null) next.push(target);
+    } else {
+      next.push(tag);
+    }
+  }
+  return [...new Set(next)].sort();
+}
+
 export function assertDocument(input) {
   if (!input || typeof input !== 'object') throw new TypeError('document must be an object');
   for (const key of ['id', 'title', 'body']) {

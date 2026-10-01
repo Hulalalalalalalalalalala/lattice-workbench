@@ -1,5 +1,5 @@
 import http from 'node:http';
-import { SnapshotError, Workspace } from './workspace.js';
+import { SnapshotError, Workspace, rewriteTagsIn, tagCounts } from './workspace.js';
 import { sameDocument } from './history.js';
 
 const MAX_BODY_BYTES = 1024 * 1024;
@@ -8,6 +8,16 @@ const ID_PATTERN = /^[a-z0-9][a-z0-9._-]*$/u;
 const DOCUMENT_FIELDS = new Set(['id', 'title', 'body', 'tags']);
 const BATCH_ACTIONS = new Set(['create', 'replace', 'delete', 'restore']);
 const MAX_BATCH_OPERATIONS = 100;
+const MAX_TAG_RULES = 100;
+
+function compareCodePoints(a, b) {
+  const left = Array.from(a, (char) => char.codePointAt(0));
+  const right = Array.from(b, (char) => char.codePointAt(0));
+  for (let i = 0; i < Math.min(left.length, right.length); i += 1) {
+    if (left[i] !== right[i]) return left[i] - right[i];
+  }
+  return left.length - right.length;
+}
 
 class HttpError extends Error {
   constructor(status, code, message) {
@@ -154,6 +164,67 @@ function validateBatchRequest(data) {
   }
 
   return { operations, dryRun };
+}
+
+// Validates the POST /tags/rewrite envelope and every rule, returning
+// `{ rules, dryRun }` with normalized (trimmed, lowercased) tag names; a null
+// target means the source tag is removed. Structural problems, wrong types,
+// empty normalized names, duplicate normalized sources, or an out-of-range
+// rule count are INVALID_TAG_RULES.
+function validateTagRewriteRequest(data) {
+  if (!data || typeof data !== 'object' || Array.isArray(data)) {
+    throw new HttpError(400, 'INVALID_TAG_RULES', 'tag rewrite body must be an object');
+  }
+  for (const key of Object.keys(data)) {
+    if (key !== 'rules' && key !== 'dryRun') {
+      throw new HttpError(400, 'INVALID_TAG_RULES', `unknown tag rewrite field: ${key}`);
+    }
+  }
+  if (!Array.isArray(data.rules)) {
+    throw new HttpError(400, 'INVALID_TAG_RULES', 'rules must be an array');
+  }
+  if (data.rules.length < 1 || data.rules.length > MAX_TAG_RULES) {
+    throw new HttpError(400, 'INVALID_TAG_RULES', `rules must contain 1 to ${MAX_TAG_RULES} items`);
+  }
+  const dryRun = data.dryRun === undefined ? false : data.dryRun;
+  if (typeof dryRun !== 'boolean') {
+    throw new HttpError(400, 'INVALID_TAG_RULES', 'dryRun must be a boolean');
+  }
+
+  const rules = data.rules.map((rule, index) => {
+    if (!rule || typeof rule !== 'object' || Array.isArray(rule)) {
+      throw new HttpError(400, 'INVALID_TAG_RULES', `rules[${index}] must be an object`);
+    }
+    const keys = Object.keys(rule);
+    if (keys.length !== 2 || !keys.includes('from') || !keys.includes('to')) {
+      throw new HttpError(400, 'INVALID_TAG_RULES', `rules[${index}] must contain exactly from and to`);
+    }
+    if (typeof rule.from !== 'string') {
+      throw new HttpError(400, 'INVALID_TAG_RULES', `rules[${index}] from must be a string`);
+    }
+    if (rule.to !== null && typeof rule.to !== 'string') {
+      throw new HttpError(400, 'INVALID_TAG_RULES', `rules[${index}] to must be a string or null`);
+    }
+    const from = rule.from.trim().toLowerCase();
+    if (!from) {
+      throw new HttpError(400, 'INVALID_TAG_RULES', `rules[${index}] from must normalize to a non-empty tag`);
+    }
+    const to = rule.to === null ? null : rule.to.trim().toLowerCase();
+    if (to !== null && !to) {
+      throw new HttpError(400, 'INVALID_TAG_RULES', `rules[${index}] to must normalize to a non-empty tag or be null`);
+    }
+    return { from, to };
+  });
+
+  const seen = new Set();
+  for (const rule of rules) {
+    if (seen.has(rule.from)) {
+      throw new HttpError(400, 'INVALID_TAG_RULES', `duplicate source tag in rules: ${rule.from}`);
+    }
+    seen.add(rule.from);
+  }
+
+  return { rules, dryRun };
 }
 
 // A document server holds one Workspace and, when a history store is supplied,
@@ -310,6 +381,56 @@ export function createDocumentServer({ workspace, save, history = null }) {
     return { snapshot, changed: true };
   }
 
+  // Applies a simultaneous tag rewrite to every existing document. Source tags
+  // that no existing document carries reject the whole request with
+  // TAG_NOT_FOUND before anything is changed. Each actually-changed document
+  // appends one `replace` record; documents whose tag set is identical after
+  // normalization are untouched. Returns `{ snapshot, changedIds }` without
+  // persisting when `dryRun` is true or no document's tags changed.
+  function commitTagRewrite(rules, dryRun) {
+    const documents = current.list();
+
+    const usedTags = new Set();
+    for (const document of documents) {
+      for (const tag of document.tags) usedTags.add(tag);
+    }
+    for (const rule of rules) {
+      if (!usedTags.has(rule.from)) {
+        throw new HttpError(404, 'TAG_NOT_FOUND', `tag not found in any document: ${rule.from}`);
+      }
+    }
+
+    const ruleMap = new Map(rules.map((rule) => [rule.from, rule.to]));
+    const candidate = new Workspace();
+    for (const document of documents) candidate.add(document);
+    const nextLedger = ledger ? ledger.clone() : null;
+
+    const changedIds = [];
+    for (const document of documents) {
+      const tags = rewriteTagsIn(document.tags, ruleMap);
+      if (tags.length !== document.tags.length || tags.some((tag, i) => tag !== document.tags[i])) {
+        candidate.remove(document.id);
+        candidate.add({ id: document.id, title: document.title, body: document.body, tags });
+        if (nextLedger) nextLedger.record(document.id, 'replace', candidate.get(document.id));
+        changedIds.push(document.id);
+      }
+    }
+    changedIds.sort(compareCodePoints);
+
+    if (dryRun) {
+      return { snapshot: candidate.exportJSON(), changedIds };
+    }
+    if (changedIds.length === 0) {
+      return { snapshot: current.exportJSON(), changedIds: [] };
+    }
+
+    const snapshot = candidate.exportJSON();
+    save(snapshot, nextLedger ? nextLedger.exportJSON(snapshot.checksum) : null);
+    current = candidate;
+    ledger = nextLedger;
+    return { snapshot, changedIds };
+  }
+
   async function createDocument(req, res) {
     const text = await readBody(req);
     requireIfMatch(req);
@@ -414,6 +535,14 @@ export function createDocumentServer({ workspace, save, history = null }) {
     sendJson(res, 200, snapshot, `"${snapshot.checksum}"`);
   }
 
+  async function rewriteTags(req, res) {
+    const text = await readBody(req);
+    requireIfMatch(req);
+    const { rules, dryRun } = validateTagRewriteRequest(parseJson(text));
+    const { snapshot, changedIds } = commitTagRewrite(rules, dryRun);
+    sendJson(res, 200, { snapshot, changedIds }, `"${snapshot.checksum}"`);
+  }
+
   async function handle(req, res) {
     const url = new URL(req.url, 'http://127.0.0.1');
     const segments = url.pathname.split('/').filter(Boolean).map(decodeURIComponent);
@@ -456,6 +585,12 @@ export function createDocumentServer({ workspace, save, history = null }) {
       return;
     } else if (resource === 'batch' && segments.length === 1 && req.method === 'POST') {
       await batch(req, res);
+      return;
+    } else if (resource === 'tags' && segments.length === 1 && req.method === 'GET') {
+      sendJson(res, 200, tagCounts(current.list()), currentEtag());
+      return;
+    } else if (resource === 'tags' && segments.length === 2 && id === 'rewrite' && req.method === 'POST') {
+      await rewriteTags(req, res);
       return;
     } else if (resource === 'search' && segments.length === 1 && req.method === 'GET') {
       sendJson(res, 200, current.search(url.searchParams.get('q') ?? ''), currentEtag());
