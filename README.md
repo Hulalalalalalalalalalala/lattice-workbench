@@ -187,6 +187,47 @@ exactly one JSON line with the actual address, e.g.
   JSON/document fields `400`, and bodies over 1 MiB `413`. Every failure
   response carries a stable `code` and never changes the stored content.
 
+#### Tag organization
+
+- `GET /tags` returns the current tags as `{ "tag", "count" }` pairs, counting
+  how many live documents carry each tag. The list is sorted by tag in Unicode
+  code-point order, an empty workspace returns `[]`, and the response carries
+  the current workspace `ETag`. Deleted documents and history revisions are not
+  counted; the counts reflect every committed change immediately.
+- `POST /tags/rewrite` reorganizes tags across all documents with a body of
+  `{ "rules": [{ "from", "to" }], "dryRun"? }`. `rules` is an array of 1 to 100
+  entries; `from` is the source tag and `to` is the target tag or `null` to
+  remove the tag. Names are trimmed and lowercased on both sides, and targets
+  that already exist merge into the existing tag with duplicates removed.
+  - Rules act on the pre-rewrite tags, so `a→b` followed by `b→c` moves the
+    original `a` to `b` and the original `b` to `c`; newly produced names are
+    never rewritten a second time. This also allows swapping two names. All
+    other tags, document ids, titles, bodies, and links are untouched, and more
+    than 100 affected documents are all processed.
+  - The body may contain only `rules` and an optional boolean `dryRun`, and
+    each rule exactly `from` and `to`. Bad structure, fields, or types, a name
+    that normalizes to empty, a duplicate normalized source, or an out-of-range
+    rule count answers `400`/`INVALID_TAG_RULES`. If any source tag is not used
+    by a live document, the whole request answers `404`/`TAG_NOT_FOUND`.
+    Malformed JSON, oversized bodies, and `If-Match` handling follow the
+    existing write behavior — including previews, which also require
+    `If-Match`. Of concurrent content-changing writes built on the same old
+    checksum, at most one commits.
+  - Success answers `200` with `{ "snapshot", "changedIds" }`. `snapshot` is
+    the result snapshot in the existing format with a matching `ETag`;
+    `changedIds` lists only the ids whose tags actually changed, sorted by code
+    point. `dryRun` defaults to `false`; when `true` the projected result is
+    returned and queries, history, and files are unchanged. When the tag set is
+    completely unchanged the current snapshot and an empty `changedIds` are
+    returned without writing a file or adding a revision.
+  - With history enabled, each actually-changed document gets exactly one
+    appended `replace` record; old revisions keep their original tags, so a
+    later restore updates the counts again. Success is confirmed only after the
+    whole save completes: a save failure answers `500`/`IO_ERROR` and leaves
+    content, counts, search, history, and files exactly as they were, and a
+    restart after a kill mid-commit lands entirely on the pre- or post-rewrite
+    state. The migration formats stay unchanged.
+
 #### Persistent history (`--history <file>`)
 
 Passing `--history <file>` enables a durable, per-document revision ledger in

@@ -1,5 +1,5 @@
 import http from 'node:http';
-import { SnapshotError, Workspace } from './workspace.js';
+import { SnapshotError, Workspace, normalizeTags } from './workspace.js';
 import { sameDocument } from './history.js';
 
 const MAX_BODY_BYTES = 1024 * 1024;
@@ -8,6 +8,21 @@ const ID_PATTERN = /^[a-z0-9][a-z0-9._-]*$/u;
 const DOCUMENT_FIELDS = new Set(['id', 'title', 'body', 'tags']);
 const BATCH_ACTIONS = new Set(['create', 'replace', 'delete', 'restore']);
 const MAX_BATCH_OPERATIONS = 100;
+const TAG_RULE_FIELDS = ['from', 'to'];
+const MAX_TAG_RULES = 100;
+
+function compareCodePoints(a, b) {
+  const left = Array.from(a, (char) => char.codePointAt(0));
+  const right = Array.from(b, (char) => char.codePointAt(0));
+  for (let i = 0; i < Math.min(left.length, right.length); i += 1) {
+    if (left[i] !== right[i]) return left[i] - right[i];
+  }
+  return left.length - right.length;
+}
+
+function sameTags(a, b) {
+  return a.length === b.length && a.every((tag, i) => tag === b[i]);
+}
 
 class HttpError extends Error {
   constructor(status, code, message) {
@@ -154,6 +169,78 @@ function validateBatchRequest(data) {
   }
 
   return { operations, dryRun };
+}
+
+// Counts current tag usage across the live documents. Deleted documents are
+// absent from the workspace and therefore never counted; history is ignored.
+function tagStats(workspace) {
+  const counts = new Map();
+  for (const document of workspace.list()) {
+    for (const tag of document.tags) counts.set(tag, (counts.get(tag) ?? 0) + 1);
+  }
+  return [...counts.entries()]
+    .map(([tag, count]) => ({ tag, count }))
+    .sort((a, b) => compareCodePoints(a.tag, b.tag));
+}
+
+// Validates the rewrite envelope and every rule, returning normalized
+// `{ rules, dryRun }` as `[{ from, to }]` pairs of trimmed, lowercased names
+// (`to` stays `null` for removals). Structural problems, empty normalized
+// names, duplicate sources, and out-of-range rule counts are INVALID_TAG_RULES.
+function validateTagRules(data) {
+  if (!data || typeof data !== 'object' || Array.isArray(data)) {
+    throw new HttpError(400, 'INVALID_TAG_RULES', 'rewrite body must be an object');
+  }
+  for (const key of Object.keys(data)) {
+    if (key !== 'rules' && key !== 'dryRun') {
+      throw new HttpError(400, 'INVALID_TAG_RULES', `unknown rewrite field: ${key}`);
+    }
+  }
+  if (!Array.isArray(data.rules)) {
+    throw new HttpError(400, 'INVALID_TAG_RULES', 'rules must be an array');
+  }
+  if (data.rules.length < 1 || data.rules.length > MAX_TAG_RULES) {
+    throw new HttpError(400, 'INVALID_TAG_RULES', `rules must contain 1 to ${MAX_TAG_RULES} items`);
+  }
+  const dryRun = data.dryRun === undefined ? false : data.dryRun;
+  if (typeof dryRun !== 'boolean') {
+    throw new HttpError(400, 'INVALID_TAG_RULES', 'dryRun must be a boolean');
+  }
+
+  const rules = data.rules.map((rule, index) => {
+    if (!rule || typeof rule !== 'object' || Array.isArray(rule)) {
+      throw new HttpError(400, 'INVALID_TAG_RULES', `rules[${index}] must be an object`);
+    }
+    const keys = Object.keys(rule);
+    if (keys.length !== TAG_RULE_FIELDS.length || !TAG_RULE_FIELDS.every((key) => keys.includes(key))) {
+      throw new HttpError(400, 'INVALID_TAG_RULES', `rules[${index}] must contain exactly from and to`);
+    }
+    if (typeof rule.from !== 'string') {
+      throw new HttpError(400, 'INVALID_TAG_RULES', `rules[${index}].from must be a string`);
+    }
+    if (typeof rule.to !== 'string' && rule.to !== null) {
+      throw new HttpError(400, 'INVALID_TAG_RULES', `rules[${index}].to must be a string or null`);
+    }
+    const from = rule.from.trim().toLowerCase();
+    const to = rule.to === null ? null : rule.to.trim().toLowerCase();
+    if (!from) {
+      throw new HttpError(400, 'INVALID_TAG_RULES', `rules[${index}].from must not be blank`);
+    }
+    if (to !== null && !to) {
+      throw new HttpError(400, 'INVALID_TAG_RULES', `rules[${index}].to must not be blank`);
+    }
+    return { from, to };
+  });
+
+  const seen = new Set();
+  for (const { from } of rules) {
+    if (seen.has(from)) {
+      throw new HttpError(400, 'INVALID_TAG_RULES', `duplicate source tag after normalization: ${from}`);
+    }
+    seen.add(from);
+  }
+
+  return { rules, dryRun };
 }
 
 // A document server holds one Workspace and, when a history store is supplied,
@@ -414,6 +501,76 @@ export function createDocumentServer({ workspace, save, history = null }) {
     sendJson(res, 200, snapshot, `"${snapshot.checksum}"`);
   }
 
+  function listTags(req, res) {
+    sendJson(res, 200, tagStats(current), currentEtag());
+  }
+
+  // Applies the tag rules to the pre-rewrite tag set of every document. Each
+  // original tag is looked up once, so a rule result is never itself rewritten
+  // (a→b then b→c moves the original `a` straight to `b`) and swaps resolve
+  // because `to` names are carried independently of the source keys. Returns
+  // `{ snapshot, changedIds }` without persisting when `dryRun` is true or the
+  // rewrite leaves the tag set unchanged.
+  function commitTagRewrite(rules, dryRun) {
+    const mapping = new Map(rules.map((rule) => [rule.from, rule.to]));
+
+    // Every source must be used by at least one currently-live document.
+    const used = new Set();
+    for (const document of current.list()) {
+      for (const tag of document.tags) used.add(tag);
+    }
+    for (const from of mapping.keys()) {
+      if (!used.has(from)) throw new HttpError(404, 'TAG_NOT_FOUND', `tag not in use: ${from}`);
+    }
+
+    const candidate = new Workspace();
+    for (const document of current.list()) candidate.add(document);
+    const nextLedger = ledger ? ledger.clone() : null;
+
+    const changedIds = [];
+    for (const document of current.list()) {
+      if (!document.tags.some((tag) => mapping.has(tag))) continue;
+      // A null target removes the tag; mapped results are emitted as-is
+      // without a second lookup, so new names are never chained further.
+      const nextTags = normalizeTags(
+        document.tags.flatMap((tag) => {
+          if (!mapping.has(tag)) return [tag];
+          const target = mapping.get(tag);
+          return target === null ? [] : [target];
+        }),
+      );
+      if (sameTags(document.tags, nextTags)) continue;
+      const updated = { id: document.id, title: document.title, body: document.body, tags: nextTags };
+      candidate.remove(document.id);
+      candidate.add(updated);
+      if (nextLedger) nextLedger.record(document.id, 'replace', candidate.get(document.id));
+      changedIds.push(document.id);
+    }
+    changedIds.sort(compareCodePoints);
+
+    if (dryRun) {
+      return { snapshot: candidate.exportJSON(), changedIds };
+    }
+    if (changedIds.length === 0) {
+      // Tag set unchanged: report the current snapshot and no file/version work.
+      return { snapshot: current.exportJSON(), changedIds: [] };
+    }
+
+    const snapshot = candidate.exportJSON();
+    save(snapshot, nextLedger ? nextLedger.exportJSON(snapshot.checksum) : null);
+    current = candidate;
+    ledger = nextLedger;
+    return { snapshot, changedIds };
+  }
+
+  async function rewriteTags(req, res) {
+    const text = await readBody(req);
+    requireIfMatch(req);
+    const { rules, dryRun } = validateTagRules(parseJson(text));
+    const { snapshot, changedIds } = commitTagRewrite(rules, dryRun);
+    sendJson(res, 200, { snapshot, changedIds }, `"${snapshot.checksum}"`);
+  }
+
   async function handle(req, res) {
     const url = new URL(req.url, 'http://127.0.0.1');
     const segments = url.pathname.split('/').filter(Boolean).map(decodeURIComponent);
@@ -456,6 +613,12 @@ export function createDocumentServer({ workspace, save, history = null }) {
       return;
     } else if (resource === 'batch' && segments.length === 1 && req.method === 'POST') {
       await batch(req, res);
+      return;
+    } else if (resource === 'tags' && segments.length === 1 && req.method === 'GET') {
+      listTags(req, res);
+      return;
+    } else if (resource === 'tags' && segments.length === 2 && id === 'rewrite' && req.method === 'POST') {
+      await rewriteTags(req, res);
       return;
     } else if (resource === 'search' && segments.length === 1 && req.method === 'GET') {
       sendJson(res, 200, current.search(url.searchParams.get('q') ?? ''), currentEtag());
