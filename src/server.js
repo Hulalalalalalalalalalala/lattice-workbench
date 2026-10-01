@@ -6,6 +6,8 @@ const MAX_BODY_BYTES = 1024 * 1024;
 const ETAG_PATTERN = /^"[0-9a-f]{64}"$/u;
 const ID_PATTERN = /^[a-z0-9][a-z0-9._-]*$/u;
 const DOCUMENT_FIELDS = new Set(['id', 'title', 'body', 'tags']);
+const BATCH_ACTIONS = new Set(['create', 'replace', 'delete', 'restore']);
+const MAX_BATCH_OPERATIONS = 100;
 
 class HttpError extends Error {
   constructor(status, code, message) {
@@ -72,6 +74,88 @@ function validateDocument(data) {
   return { id: data.id, title: data.title, body: data.body, tags: data.tags ?? [] };
 }
 
+// Validates the batch envelope and every operation, returning normalized
+// `{ operations, dryRun }`. Structural problems (bad envelope shape, unknown
+// type, wrong fields, missing id, non-string id) are INVALID_BATCH; document
+// content problems follow the single-document rules (INVALID_DOCUMENT), and a
+// revision that is not a positive integer is INVALID_REVISION.
+function validateBatchRequest(data) {
+  if (!data || typeof data !== 'object' || Array.isArray(data)) {
+    throw new HttpError(400, 'INVALID_BATCH', 'batch body must be an object');
+  }
+  for (const key of Object.keys(data)) {
+    if (key !== 'operations' && key !== 'dryRun') {
+      throw new HttpError(400, 'INVALID_BATCH', `unknown batch field: ${key}`);
+    }
+  }
+  if (!Array.isArray(data.operations)) {
+    throw new HttpError(400, 'INVALID_BATCH', 'operations must be an array');
+  }
+  if (data.operations.length < 1 || data.operations.length > MAX_BATCH_OPERATIONS) {
+    throw new HttpError(400, 'INVALID_BATCH', `operations must contain 1 to ${MAX_BATCH_OPERATIONS} items`);
+  }
+  const dryRun = data.dryRun === undefined ? false : data.dryRun;
+  if (typeof dryRun !== 'boolean') {
+    throw new HttpError(400, 'INVALID_BATCH', 'dryRun must be a boolean');
+  }
+
+  const operations = data.operations.map((op, index) => {
+    if (!op || typeof op !== 'object' || Array.isArray(op)) {
+      throw new HttpError(400, 'INVALID_BATCH', `operations[${index}] must be an object`);
+    }
+    const type = op.type;
+    if (typeof type !== 'string' || !BATCH_ACTIONS.has(type)) {
+      throw new HttpError(400, 'INVALID_BATCH', `operations[${index}] has an unknown type`);
+    }
+    const expectedKeys = type === 'create' || type === 'replace'
+      ? ['type', 'document']
+      : type === 'delete'
+        ? ['type', 'id']
+        : ['type', 'id', 'revision'];
+    const keys = Object.keys(op);
+    if (keys.length !== expectedKeys.length || !expectedKeys.every((key) => keys.includes(key))) {
+      throw new HttpError(400, 'INVALID_BATCH', `operations[${index}] has invalid fields for ${type}`);
+    }
+
+    if (type === 'create' || type === 'replace') {
+      if (!op.document || typeof op.document !== 'object' || Array.isArray(op.document)) {
+        throw new HttpError(400, 'INVALID_BATCH', `operations[${index}] document must be an object`);
+      }
+      return { type, document: validateDocument(op.document) };
+    }
+
+    if (typeof op.id !== 'string') {
+      throw new HttpError(400, 'INVALID_BATCH', `operations[${index}] id must be a string`);
+    }
+
+    if (type === 'delete') {
+      return { type, id: op.id };
+    }
+
+    // restore: the envelope is structurally valid; the revision value itself
+    // follows the single-document restore rules.
+    if (op.revision === undefined) {
+      throw new HttpError(400, 'INVALID_BATCH', `operations[${index}] restore requires a revision`);
+    }
+    if (!Number.isInteger(op.revision) || op.revision < 1) {
+      throw new HttpError(400, 'INVALID_REVISION', `operations[${index}] revision must be a positive integer`);
+    }
+    return { type, id: op.id, revision: op.revision };
+  });
+
+  // Every operation targets a distinct document id.
+  const seen = new Set();
+  for (const op of operations) {
+    const id = op.type === 'create' || op.type === 'replace' ? op.document.id : op.id;
+    if (seen.has(id)) {
+      throw new HttpError(400, 'INVALID_BATCH', `duplicate target id in batch: ${id}`);
+    }
+    seen.add(id);
+  }
+
+  return { operations, dryRun };
+}
+
 // A document server holds one Workspace and, when a history store is supplied,
 // a per-document revision ledger. Every committed change is persisted through
 // `save(snapshot, historySnapshot)` before the in-memory state is swapped, so a
@@ -123,6 +207,107 @@ export function createDocumentServer({ workspace, save, history = null }) {
     current = candidate;
     ledger = nextLedger;
     return snapshot;
+  }
+
+  // Applies every operation in one atomic step. Existence and restore-version
+  // checks all run against the pre-commit state, so a batch is rejected whole
+  // if any operation would fail. Title conflicts are checked against the final
+  // projected set, making swaps and release-then-reuse independent of
+  // operation order. Each actually-changed document appends one record; a
+  // normalized-identical replace or restore appends nothing. Returns
+  // `{ snapshot, changed }` without persisting when `dryRun` is true or the
+  // batch is content-preserving.
+  function commitBatch(operations, dryRun) {
+    // Pre-commit state checks.
+    for (const op of operations) {
+      if (op.type === 'create') {
+        if (current.get(op.document.id)) {
+          throw new HttpError(409, 'CONFLICT', `document already exists: ${op.document.id}`);
+        }
+      } else if (op.type === 'replace') {
+        if (!current.get(op.document.id)) {
+          throw new HttpError(404, 'NOT_FOUND', `document not found: ${op.document.id}`);
+        }
+      } else if (op.type === 'delete') {
+        if (!current.get(op.id)) {
+          throw new HttpError(404, 'NOT_FOUND', `document not found: ${op.id}`);
+        }
+      } else if (op.type === 'restore') {
+        if (!ledger) {
+          throw new HttpError(404, 'NOT_FOUND', 'history is not enabled');
+        }
+        const chain = ledger.entries(op.id);
+        if (!chain) {
+          throw new HttpError(404, 'NOT_FOUND', `document never existed: ${op.id}`);
+        }
+        const target = ledger.entry(op.id, op.revision);
+        if (!target) {
+          throw new HttpError(404, 'NOT_FOUND', `unknown revision ${op.revision} for document ${op.id}`);
+        }
+        if (target.action === 'delete') {
+          throw new HttpError(400, 'INVALID_REVISION', `revision ${op.revision} of document ${op.id} is a delete and cannot be restored`);
+        }
+      }
+    }
+
+    const candidate = new Workspace();
+    for (const document of current.list()) candidate.add(document);
+    const nextLedger = ledger ? ledger.clone() : null;
+
+    let changed = false;
+    for (const op of operations) {
+      if (op.type === 'create') {
+        candidate.add(op.document);
+        if (nextLedger) nextLedger.record(op.document.id, 'create', candidate.get(op.document.id));
+        changed = true;
+      } else if (op.type === 'replace') {
+        const before = current.get(op.document.id);
+        candidate.remove(op.document.id);
+        candidate.add(op.document);
+        const stored = candidate.get(op.document.id);
+        if (!sameDocument(before, stored)) {
+          if (nextLedger) nextLedger.record(op.document.id, 'replace', stored);
+          changed = true;
+        }
+      } else if (op.type === 'delete') {
+        candidate.remove(op.id);
+        if (nextLedger) nextLedger.record(op.id, 'delete', null);
+        changed = true;
+      } else if (op.type === 'restore') {
+        const before = current.get(op.id);
+        const target = ledger.entry(op.id, op.revision);
+        candidate.remove(op.id);
+        candidate.add(target.document);
+        const stored = candidate.get(op.id);
+        if (!before || !sameDocument(before, stored)) {
+          nextLedger.record(op.id, 'restore', stored);
+          changed = true;
+        }
+      }
+    }
+
+    // Title conflicts are checked against the final projected set, so
+    // operation order cannot make a swap or release-then-reuse fail.
+    const titles = new Set();
+    for (const document of candidate.list()) {
+      if (titles.has(document.title)) {
+        throw new HttpError(409, 'CONFLICT', `title conflict in batch: ${document.title}`);
+      }
+      titles.add(document.title);
+    }
+
+    if (dryRun) {
+      return { snapshot: candidate.exportJSON(), changed };
+    }
+    if (!changed) {
+      return { snapshot: current.exportJSON(), changed: false };
+    }
+
+    const snapshot = candidate.exportJSON();
+    save(snapshot, nextLedger ? nextLedger.exportJSON(snapshot.checksum) : null);
+    current = candidate;
+    ledger = nextLedger;
+    return { snapshot, changed: true };
   }
 
   async function createDocument(req, res) {
@@ -220,6 +405,15 @@ export function createDocumentServer({ workspace, save, history = null }) {
     sendJson(res, 200, snapshot, `"${snapshot.checksum}"`);
   }
 
+  async function batch(req, res) {
+    const text = await readBody(req);
+    requireIfMatch(req);
+    const data = parseJson(text);
+    const { operations, dryRun } = validateBatchRequest(data);
+    const { snapshot } = commitBatch(operations, dryRun);
+    sendJson(res, 200, snapshot, `"${snapshot.checksum}"`);
+  }
+
   async function handle(req, res) {
     const url = new URL(req.url, 'http://127.0.0.1');
     const segments = url.pathname.split('/').filter(Boolean).map(decodeURIComponent);
@@ -259,6 +453,9 @@ export function createDocumentServer({ workspace, save, history = null }) {
       return;
     } else if (resource === 'documents' && segments.length === 3 && relation === 'restore' && req.method === 'POST') {
       await restoreDocument(req, res, id);
+      return;
+    } else if (resource === 'batch' && segments.length === 1 && req.method === 'POST') {
+      await batch(req, res);
       return;
     } else if (resource === 'search' && segments.length === 1 && req.method === 'GET') {
       sendJson(res, 200, current.search(url.searchParams.get('q') ?? ''), currentEtag());
