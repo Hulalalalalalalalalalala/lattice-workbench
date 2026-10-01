@@ -1,5 +1,6 @@
 import http from 'node:http';
 import { SnapshotError, Workspace } from './workspace.js';
+import { appendRecord, recordsFor } from './history.js';
 
 const MAX_BODY_BYTES = 1024 * 1024;
 const ETAG_PATTERN = /^"[0-9a-f]{64}"$/u;
@@ -68,14 +69,28 @@ function validateDocument(data) {
   if (data.tags !== undefined && (!Array.isArray(data.tags) || data.tags.some((tag) => typeof tag !== 'string'))) {
     throw new HttpError(400, 'INVALID_DOCUMENT', 'tags must be an array of strings');
   }
-  return { id: data.id, title: data.title, body: data.body, tags: data.tags ?? [] };
+  const tags = [...new Set(data.tags.map((tag) => tag.trim().toLowerCase()).filter(Boolean))].sort();
+  return { id: data.id, title: data.title.trim(), body: data.body, tags };
 }
 
-// A document server holds one Workspace and persists every committed change
-// through `save(snapshot)` before the in-memory state is swapped, so a failed
-// save leaves memory, queries, and the original file untouched.
-export function createDocumentServer({ workspace, save }) {
+function sameDocument(a, b) {
+  return a.id === b.id && a.title === b.title && a.body === b.body
+    && a.tags.length === b.tags.length && a.tags.every((tag, i) => tag === b.tags[i]);
+}
+
+function copyOf(workspace) {
+  const candidate = new Workspace();
+  for (const document of workspace.list()) candidate.add(document);
+  return candidate;
+}
+
+// A document server holds one Workspace and, when history is enabled, its
+// per-document revision log. Every committed change is persisted through
+// `commit(snapshot, history)` before the in-memory state is swapped, so a
+// failed save leaves memory, queries, history, and the files untouched.
+export function createDocumentServer({ workspace, history = null, commit }) {
   let current = workspace;
+  let historyState = history;
 
   const currentEtag = () => `"${current.exportJSON().checksum}"`;
 
@@ -92,25 +107,24 @@ export function createDocumentServer({ workspace, save }) {
     }
   }
 
-  function assertTitleFree(candidate, title) {
+  function assertTitleFree(candidate, title, excludeId) {
     const trimmed = title.trim();
     for (const existing of candidate.list()) {
+      if (existing.id === excludeId) continue;
       if (existing.title === trimmed) {
         throw new HttpError(409, 'CONFLICT', `title already in use: ${trimmed}`);
       }
     }
   }
 
-  // Builds the next state on a candidate workspace, persists its version-1
-  // snapshot, and only then installs it. Everything here is synchronous, so a
-  // commit is atomic with respect to other requests.
-  function commit(mutate) {
-    const candidate = new Workspace();
-    for (const document of current.list()) candidate.add(document);
-    mutate(candidate);
-    const snapshot = candidate.exportJSON();
-    save(snapshot);
-    current = candidate;
+  // Persists the next snapshot and history together, and only then installs
+  // them. Everything here is synchronous, so a commit is atomic with respect
+  // to other requests.
+  function persist(nextWorkspace, nextHistory) {
+    const snapshot = nextWorkspace.exportJSON();
+    commit(snapshot, nextHistory);
+    current = nextWorkspace;
+    historyState = nextHistory;
     return snapshot;
   }
 
@@ -118,13 +132,14 @@ export function createDocumentServer({ workspace, save }) {
     const text = await readBody(req);
     requireIfMatch(req);
     const document = validateDocument(parseJson(text));
-    const snapshot = commit((candidate) => {
-      if (candidate.get(document.id)) {
-        throw new HttpError(409, 'CONFLICT', `document already exists: ${document.id}`);
-      }
-      assertTitleFree(candidate, document.title);
-      candidate.add(document);
-    });
+    if (current.get(document.id)) {
+      throw new HttpError(409, 'CONFLICT', `document already exists: ${document.id}`);
+    }
+    const candidate = copyOf(current);
+    assertTitleFree(candidate, document.title);
+    candidate.add(document);
+    const nextHistory = historyState ? appendRecord(historyState, document.id, 'create', document) : null;
+    const snapshot = persist(candidate, nextHistory);
     sendJson(res, 201, snapshot, `"${snapshot.checksum}"`);
   }
 
@@ -135,14 +150,22 @@ export function createDocumentServer({ workspace, save }) {
     if (document.id !== id) {
       throw new HttpError(400, 'ID_MISMATCH', `path id ${id} does not match body id ${document.id}`);
     }
-    if (!current.get(id)) {
+    const existing = current.get(id);
+    if (!existing) {
       throw new HttpError(404, 'NOT_FOUND', `document not found: ${id}`);
     }
-    const snapshot = commit((candidate) => {
-      candidate.remove(id);
-      assertTitleFree(candidate, document.title);
-      candidate.add(document);
-    });
+    // A replace that leaves the normalized content unchanged still succeeds,
+    // but does not consume a revision.
+    if (sameDocument(existing, document)) {
+      sendJson(res, 200, current.exportJSON(), currentEtag());
+      return;
+    }
+    const candidate = copyOf(current);
+    candidate.remove(id);
+    assertTitleFree(candidate, document.title, id);
+    candidate.add(document);
+    const nextHistory = historyState ? appendRecord(historyState, id, 'replace', document) : null;
+    const snapshot = persist(candidate, nextHistory);
     sendJson(res, 200, snapshot, `"${snapshot.checksum}"`);
   }
 
@@ -151,10 +174,61 @@ export function createDocumentServer({ workspace, save }) {
     if (!current.get(id)) {
       throw new HttpError(404, 'NOT_FOUND', `document not found: ${id}`);
     }
-    const snapshot = commit((candidate) => {
-      candidate.remove(id);
-    });
+    const candidate = copyOf(current);
+    candidate.remove(id);
+    const nextHistory = historyState ? appendRecord(historyState, id, 'delete', null) : null;
+    const snapshot = persist(candidate, nextHistory);
     sendJson(res, 200, snapshot, `"${snapshot.checksum}"`);
+  }
+
+  async function restoreDocument(req, res, id) {
+    const text = await readBody(req);
+    requireIfMatch(req);
+    const body = parseJson(text);
+    if (!body || typeof body !== 'object' || Array.isArray(body)
+      || Object.keys(body).length !== 1 || !Number.isInteger(body.revision) || body.revision <= 0) {
+      throw new HttpError(400, 'INVALID_REVISION', 'body must contain only a positive integer revision');
+    }
+    if (!historyState) {
+      throw new HttpError(404, 'NOT_FOUND', `document not found: ${id}`);
+    }
+    const records = recordsFor(historyState, id);
+    if (!records) {
+      throw new HttpError(404, 'NOT_FOUND', `document not found: ${id}`);
+    }
+    const record = records.find((candidate) => candidate.revision === body.revision);
+    if (!record) {
+      throw new HttpError(404, 'NOT_FOUND', `revision not found: ${body.revision}`);
+    }
+    if (record.action === 'delete') {
+      throw new HttpError(400, 'INVALID_REVISION', 'cannot restore a deleted revision');
+    }
+    const restored = record.document;
+    const existing = current.get(id);
+    // A restore that leaves the normalized content unchanged still succeeds,
+    // but does not consume a revision.
+    if (existing && sameDocument(existing, restored)) {
+      sendJson(res, 200, current.exportJSON(), currentEtag());
+      return;
+    }
+    const candidate = copyOf(current);
+    if (existing) candidate.remove(id);
+    assertTitleFree(candidate, restored.title, id);
+    candidate.add(restored);
+    const nextHistory = appendRecord(historyState, id, 'restore', restored);
+    const snapshot = persist(candidate, nextHistory);
+    sendJson(res, 200, snapshot, `"${snapshot.checksum}"`);
+  }
+
+  function readHistory(req, res, id) {
+    if (!historyState) {
+      throw new HttpError(404, 'NOT_FOUND', `document not found: ${id}`);
+    }
+    const records = recordsFor(historyState, id);
+    if (!records) {
+      throw new HttpError(404, 'NOT_FOUND', `document not found: ${id}`);
+    }
+    sendJson(res, 200, records, currentEtag());
   }
 
   async function handle(req, res) {
@@ -190,6 +264,12 @@ export function createDocumentServer({ workspace, save }) {
       const links = current.links(id);
       if (!links) throw new HttpError(404, 'NOT_FOUND', `document not found: ${id}`);
       sendJson(res, 200, links, currentEtag());
+      return;
+    } else if (resource === 'documents' && segments.length === 3 && relation === 'history' && req.method === 'GET') {
+      readHistory(req, res, id);
+      return;
+    } else if (resource === 'documents' && segments.length === 3 && relation === 'restore' && req.method === 'POST') {
+      await restoreDocument(req, res, id);
       return;
     } else if (resource === 'search' && segments.length === 1 && req.method === 'GET') {
       sendJson(res, 200, current.search(url.searchParams.get('q') ?? ''), currentEtag());

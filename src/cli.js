@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { createDocumentServer } from './server.js';
 import { SnapshotError, Workspace } from './workspace.js';
+import { appendRecord, assertHistoryConsistent, loadHistory, newHistory } from './history.js';
 
 function demo() {
   const workspace = new Workspace();
@@ -39,6 +40,137 @@ function atomicWrite(file, content) {
     }
     throw new SnapshotError('IO_ERROR', `cannot write snapshot file ${file}: ${error.message}`);
   }
+}
+
+// --- history transactions -------------------------------------------------
+// A commit must move the snapshot and its history from one consistent pair to
+// the next. A journal written before the rename pair lets a process killed
+// mid-commit recover: on restart the journal is replayed, so the presented
+// state is always either the pre-commit or the post-commit pair.
+
+function journalPath(snapshotFile) {
+  return path.join(path.dirname(path.resolve(snapshotFile)), `.${path.basename(snapshotFile)}.txn`);
+}
+
+function writeTemp(file, content) {
+  const temp = `${file}.tmp`;
+  fs.writeFileSync(temp, content, 'utf8');
+  const handle = fs.openSync(temp, 'r+');
+  try {
+    fs.fsyncSync(handle);
+  } finally {
+    fs.closeSync(handle);
+  }
+}
+
+// Atomically replaces `file` with `${file}.tmp`, keeping a `${file}.bak` copy
+// of the original. On failure the original is restored.
+function installFile(file) {
+  const temp = `${file}.tmp`;
+  const backup = `${file}.bak`;
+  let movedOriginal = false;
+  try {
+    if (fs.existsSync(file)) {
+      fs.renameSync(file, backup);
+      movedOriginal = true;
+    }
+    fs.renameSync(temp, file);
+  } catch (error) {
+    if (movedOriginal) {
+      try {
+        fs.renameSync(backup, file);
+      } catch {
+        // best-effort restore; the journal will complete the transaction
+      }
+    }
+    throw error;
+  }
+}
+
+// Restores `file` from its `.bak` copy, undoing an installFile.
+function restoreFile(file) {
+  const backup = `${file}.bak`;
+  if (!fs.existsSync(backup)) return;
+  if (fs.existsSync(file)) {
+    fs.renameSync(file, `${file}.tmp`);
+  }
+  fs.renameSync(backup, file);
+  fs.rmSync(`${file}.tmp`, { force: true });
+}
+
+function removeIfExists(file) {
+  try {
+    fs.rmSync(file, { force: true });
+  } catch {
+    // best-effort cleanup
+  }
+}
+
+// Persists the next snapshot and history as one transaction. If either file
+// cannot be written, both are left untouched and IO_ERROR is thrown.
+function commitFiles(snapshotFile, historyFile, snapshotContent, historyContent) {
+  const journal = journalPath(snapshotFile);
+  const temps = [snapshotFile, historyFile, journal].map((file) => `${file}.tmp`);
+  const backups = [snapshotFile, historyFile].map((file) => `${file}.bak`);
+  let failed = false;
+  try {
+    writeTemp(snapshotFile, snapshotContent);
+    writeTemp(historyFile, historyContent);
+    writeTemp(journal, JSON.stringify({ version: 1, snapshot: snapshotContent, history: historyContent }));
+    installFile(snapshotFile);
+    installFile(historyFile);
+  } catch (error) {
+    failed = true;
+    try {
+      restoreFile(historyFile);
+      restoreFile(snapshotFile);
+    } catch {
+      // Rollback failed: leave the journal in place so a restart can complete
+      // the transaction.
+      throw new SnapshotError('IO_ERROR', `cannot write snapshot/history: ${error.message}`);
+    }
+    throw new SnapshotError('IO_ERROR', `cannot write snapshot/history: ${error.message}`);
+  } finally {
+    for (const temp of temps) removeIfExists(temp);
+    for (const backup of backups) removeIfExists(backup);
+    if (!failed) removeIfExists(journal);
+  }
+}
+
+// Replays a leftover journal, completing an interrupted transaction. Returns
+// true when a journal was replayed.
+function recoverJournal(snapshotFile, historyFile) {
+  const journal = journalPath(snapshotFile);
+  if (!fs.existsSync(journal)) return false;
+  let payload;
+  try {
+    payload = JSON.parse(fs.readFileSync(journal, 'utf8'));
+  } catch (error) {
+    throw new SnapshotError('INVALID_HISTORY', `cannot read transaction journal: ${error.message}`);
+  }
+  if (!payload || payload.version !== 1
+    || typeof payload.snapshot !== 'string' || typeof payload.history !== 'string') {
+    throw new SnapshotError('INVALID_HISTORY', 'invalid transaction journal');
+  }
+  let ok = false;
+  try {
+    writeTemp(snapshotFile, payload.snapshot);
+    writeTemp(historyFile, payload.history);
+    installFile(snapshotFile);
+    installFile(historyFile);
+    ok = true;
+  } catch (error) {
+    throw new SnapshotError('IO_ERROR', `cannot complete transaction: ${error.message}`);
+  } finally {
+    for (const file of [snapshotFile, historyFile]) {
+      removeIfExists(`${file}.tmp`);
+      removeIfExists(`${file}.bak`);
+    }
+    // Only consume the journal when the transaction completed; a failure
+    // leaves it for the next restart to retry.
+    if (ok) removeIfExists(journal);
+  }
+  return true;
 }
 
 function parseMigrateArgs(args) {
@@ -89,6 +221,7 @@ function parsePort(value) {
 function parseServeArgs(args) {
   const positionals = [];
   let port = 3000;
+  let historyFile = null;
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index];
     if (arg === '--port') {
@@ -97,6 +230,12 @@ function parseServeArgs(args) {
       port = parsePort(args[index]);
     } else if (arg.startsWith('--port=')) {
       port = parsePort(arg.slice('--port='.length));
+    } else if (arg === '--history') {
+      index += 1;
+      if (index >= args.length) throw new SnapshotError('INVALID_OPTIONS', '--history requires a value');
+      historyFile = args[index];
+    } else if (arg.startsWith('--history=')) {
+      historyFile = arg.slice('--history='.length);
     } else if (arg.startsWith('--')) {
       throw new SnapshotError('INVALID_OPTIONS', `unknown option: ${arg}`);
     } else {
@@ -104,23 +243,63 @@ function parseServeArgs(args) {
     }
   }
   if (positionals.length !== 1) {
-    throw new SnapshotError('INVALID_OPTIONS', 'usage: serve <snapshot> [--port <port>]');
+    throw new SnapshotError('INVALID_OPTIONS', 'usage: serve <snapshot> [--port <port>] [--history <file>]');
   }
-  return { file: positionals[0], port };
+  return { file: positionals[0], port, historyFile };
 }
 
 function serve(args) {
-  const { file, port } = parseServeArgs(args);
+  const { file, port, historyFile } = parseServeArgs(args);
+  if (historyFile && path.resolve(file) === path.resolve(historyFile)) {
+    throw new SnapshotError('INVALID_OPTIONS', 'snapshot and history files must be different paths');
+  }
 
-  const workspace = new Workspace();
+  let workspace = new Workspace();
   if (fs.existsSync(file)) {
     // An unreadable or invalid snapshot is fatal; the file is left untouched.
     workspace.importJSON(readSnapshotFile(file), { mode: 'replace' });
   }
 
+  let history = null;
+  if (historyFile) {
+    // A leftover journal from an interrupted commit is replayed before either
+    // file is read, so the pair is always presented in a consistent state.
+    if (recoverJournal(file, historyFile)) {
+      workspace = new Workspace();
+      workspace.importJSON(readSnapshotFile(file), { mode: 'replace' });
+    }
+    if (fs.existsSync(historyFile)) {
+      let text;
+      try {
+        text = fs.readFileSync(historyFile, 'utf8');
+      } catch (error) {
+        throw new SnapshotError('IO_ERROR', `cannot read history file ${historyFile}: ${error.message}`);
+      }
+      history = loadHistory(text);
+      assertHistoryConsistent(workspace, history);
+    } else {
+      // No history file yet: every existing document gets a revision-1
+      // baseline; new documents will start at revision 1 with a create.
+      history = newHistory();
+      for (const document of workspace.list()) {
+        history = appendRecord(history, document.id, 'baseline', document);
+      }
+    }
+  }
+
+  const commit = historyFile
+    ? (snapshot, nextHistory) => commitFiles(
+        file,
+        historyFile,
+        `${JSON.stringify(snapshot)}\n`,
+        `${JSON.stringify(nextHistory)}\n`,
+      )
+    : (snapshot) => atomicWrite(file, `${JSON.stringify(snapshot)}\n`);
+
   const server = createDocumentServer({
     workspace,
-    save: (snapshot) => atomicWrite(file, `${JSON.stringify(snapshot)}\n`),
+    history,
+    commit,
   });
   server.on('error', (error) => {
     reportError(new SnapshotError('IO_ERROR', `cannot serve ${file}: ${error.message}`));
@@ -155,6 +334,6 @@ if (command === 'demo') {
     reportError(error);
   }
 } else {
-  process.stderr.write('Usage: node src/cli.js demo | node src/cli.js migrate <base> <incoming> <output> <mode> [--dry-run] | node src/cli.js serve <snapshot> [--port <port>]\n');
+  process.stderr.write('Usage: node src/cli.js demo | node src/cli.js migrate <base> <incoming> <output> <mode> [--dry-run] | node src/cli.js serve <snapshot> [--port <port>] [--history <file>]\n');
   process.exitCode = 1;
 }

@@ -99,7 +99,7 @@ same path as `base` (the file is replaced atomically via a staging file).
 ### `serve` command
 
 ```bash
-node src/cli.js serve <snapshot> [--port <port>]
+node src/cli.js serve <snapshot> [--port <port>] [--history <file>]
 ```
 
 Serves one workspace over HTTP on `127.0.0.1` (default port `3000`; `--port 0`
@@ -131,3 +131,53 @@ exactly one JSON line with the actual address, e.g.
   case-sensitive), missing documents `404`, a path/body id mismatch or invalid
   JSON/document fields `400`, and bodies over 1 MiB `413`. Every failure
   response carries a stable `code` and never changes the stored content.
+
+### History
+
+When `--history <file>` is given, the server keeps a per-document revision log
+alongside the version-1 snapshot. Without it, behavior is unchanged.
+
+- When no history file exists yet, every document already in the snapshot gets
+  a revision-1 `baseline`; documents created later start at revision 1 with a
+  `create`. Each create, replace, delete, and restore appends one revision to
+  the same id's sequence, which continues across deletes and re-creates. A
+  replace or restore whose normalized content equals the current content still
+  succeeds but does not append a revision.
+- The history file is versioned and checksummed like the snapshot, but its
+  checksum never mixes with the snapshot's. Current content and history are
+  committed together; if either cannot be saved, `500` with `IO_ERROR` is
+  returned and memory, queries, history, and the files stay as they were. A
+  journal written before the commit's renames lets a process killed mid-save
+  present either the pre-commit or the post-commit complete state on restart.
+- If the history file cannot be read, startup fails with `IO_ERROR`; if it is
+  corrupted or cannot be restored to a state consistent with the snapshot,
+  startup fails with `INVALID_HISTORY`. Either way the process exits `1`,
+  standard error contains exactly one JSON line with the `code`, and the
+  original files are left untouched. Passing the same path for the snapshot and
+  the history is rejected with `INVALID_OPTIONS`.
+
+#### `GET /documents/:id/history`
+
+Returns the document's revisions in ascending order, each shaped
+`{ "revision", "action", "document" }`. `action` is one of `baseline`,
+`create`, `replace`, `delete`, `restore`; a delete record's `document` is
+`null` and every other record carries the full document as it was at that
+revision. Deleted documents remain queryable; a document that never appeared
+in the history answers `404` with `NOT_FOUND`.
+
+#### `POST /documents/:id/restore`
+
+```json
+{ "revision": 2 }
+```
+
+Restores the title, body, and tags of the given revision, including for a
+deleted document. The body must be an object containing only a positive
+integer `revision`; anything else answers `400` with `INVALID_REVISION`, as
+does selecting a delete revision. A missing revision answers `404` with
+`NOT_FOUND`. If the restored title collides with another document's title, the
+answer is `409` with `CONFLICT`. On success the response is `200` with the
+current snapshot and its `ETag`, and a `restore` revision is appended; the
+document's old records are unchanged. Restore follows the existing `If-Match`
+check and the 1 MiB request limit, never rewrites other documents' bodies, and
+updates search and derived links to the restored content.
