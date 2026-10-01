@@ -10,6 +10,14 @@ const BATCH_ACTIONS = new Set(['create', 'replace', 'delete', 'restore']);
 const MAX_BATCH_OPERATIONS = 100;
 const TAG_RULE_FIELDS = ['from', 'to'];
 const MAX_TAG_RULES = 100;
+const RECONCILE_FIELDS = new Set(['base', 'incoming', 'dryRun']);
+
+// Maps SnapshotError codes to HTTP statuses for the reconcile endpoint.
+const SNAPSHOT_STATUS = {
+  INVALID_OPTIONS: 400,
+  INVALID_SNAPSHOT: 400,
+  RECONCILE_CONFLICT: 409,
+};
 
 function compareCodePoints(a, b) {
   const left = Array.from(a, (char) => char.codePointAt(0));
@@ -241,6 +249,32 @@ function validateTagRules(data) {
   }
 
   return { rules, dryRun };
+}
+
+// Validates the reconcile envelope: an object containing exactly `base`,
+// `incoming`, and an optional boolean `dryRun`. Structural problems are
+// INVALID_OPTIONS; the two snapshots themselves are validated by the existing
+// snapshot rules inside the Workspace.reconcile call.
+function validateReconcileRequest(data) {
+  if (!data || typeof data !== 'object' || Array.isArray(data)) {
+    throw new HttpError(400, 'INVALID_OPTIONS', 'reconcile body must be an object');
+  }
+  for (const key of Object.keys(data)) {
+    if (!RECONCILE_FIELDS.has(key)) {
+      throw new HttpError(400, 'INVALID_OPTIONS', `unknown reconcile field: ${key}`);
+    }
+  }
+  if (data.base === undefined) {
+    throw new HttpError(400, 'INVALID_OPTIONS', 'base is required');
+  }
+  if (data.incoming === undefined) {
+    throw new HttpError(400, 'INVALID_OPTIONS', 'incoming is required');
+  }
+  const dryRun = data.dryRun === undefined ? false : data.dryRun;
+  if (typeof dryRun !== 'boolean') {
+    throw new HttpError(400, 'INVALID_OPTIONS', 'dryRun must be a boolean');
+  }
+  return { base: data.base, incoming: data.incoming, dryRun };
 }
 
 // A document server holds one Workspace and, when a history store is supplied,
@@ -563,12 +597,69 @@ export function createDocumentServer({ workspace, save, history = null }) {
     return { snapshot, changedIds };
   }
 
+  // Three-way merge of an offline-edited snapshot against the live state.
+  // Builds the projected state on a candidate workspace, appends history
+  // records for every changed document (create for new/reappeared, replace for
+  // modified, delete for removed), and persists the whole thing atomically.
+  // Returns `{ snapshot, changed }` without persisting when `dryRun` is true or
+  // the merge is content-preserving.
+  function commitReconcile(baseData, incomingData, dryRun) {
+    const candidate = new Workspace();
+    for (const document of current.list()) candidate.add(document);
+    const nextLedger = ledger ? ledger.clone() : null;
+
+    // Throws RECONCILE_CONFLICT if any field or add/delete conflict exists.
+    const snapshot = candidate.reconcile(baseData, incomingData, { dryRun: false });
+
+    const changed = snapshot.checksum !== current.exportJSON().checksum;
+
+    if (dryRun) {
+      return { snapshot, changed };
+    }
+    if (!changed) {
+      // Content-preserving: no write, no revision.
+      return { snapshot: current.exportJSON(), changed: false };
+    }
+
+    if (nextLedger) {
+      const currentMap = new Map(current.list().map((document) => [document.id, document]));
+      const nextMap = new Map(snapshot.documents.map((document) => [document.id, document]));
+      for (const [id, document] of nextMap) {
+        const before = currentMap.get(id);
+        if (!before) {
+          nextLedger.record(id, 'create', document);
+        } else if (!sameDocument(before, document)) {
+          nextLedger.record(id, 'replace', document);
+        }
+      }
+      for (const [id] of currentMap) {
+        if (!nextMap.has(id)) {
+          nextLedger.record(id, 'delete', null);
+        }
+      }
+    }
+
+    save(snapshot, nextLedger ? nextLedger.exportJSON(snapshot.checksum) : null);
+    current = candidate;
+    ledger = nextLedger;
+    return { snapshot, changed: true };
+  }
+
   async function rewriteTags(req, res) {
     const text = await readBody(req);
     requireIfMatch(req);
     const { rules, dryRun } = validateTagRules(parseJson(text));
     const { snapshot, changedIds } = commitTagRewrite(rules, dryRun);
     sendJson(res, 200, { snapshot, changedIds }, `"${snapshot.checksum}"`);
+  }
+
+  async function reconcile(req, res) {
+    const text = await readBody(req);
+    requireIfMatch(req);
+    const data = parseJson(text);
+    const { base, incoming, dryRun } = validateReconcileRequest(data);
+    const { snapshot } = commitReconcile(base, incoming, dryRun);
+    sendJson(res, 200, snapshot, `"${snapshot.checksum}"`);
   }
 
   async function handle(req, res) {
@@ -620,6 +711,9 @@ export function createDocumentServer({ workspace, save, history = null }) {
     } else if (resource === 'tags' && segments.length === 2 && id === 'rewrite' && req.method === 'POST') {
       await rewriteTags(req, res);
       return;
+    } else if (resource === 'snapshots' && segments.length === 2 && id === 'reconcile' && req.method === 'POST') {
+      await reconcile(req, res);
+      return;
     } else if (resource === 'search' && segments.length === 1 && req.method === 'GET') {
       sendJson(res, 200, current.search(url.searchParams.get('q') ?? ''), currentEtag());
       return;
@@ -633,11 +727,15 @@ export function createDocumentServer({ workspace, save, history = null }) {
         res.destroy(error);
         return;
       }
-      const status = error instanceof HttpError ? error.status : 500;
+      const status = error instanceof HttpError ? error.status
+        : error instanceof SnapshotError ? (SNAPSHOT_STATUS[error.code] ?? 500)
+          : 500;
       const code = error instanceof HttpError ? error.code
         : error instanceof SnapshotError ? error.code
           : 'INTERNAL_ERROR';
-      sendJson(res, status, { code, message: error.message });
+      const payload = { code, message: error.message };
+      if (Array.isArray(error.conflicts)) payload.conflicts = error.conflicts;
+      sendJson(res, status, payload);
     });
   });
   return server;

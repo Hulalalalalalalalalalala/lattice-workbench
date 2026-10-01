@@ -157,6 +157,39 @@ function sameDocument(a, b) {
     && a.tags.length === b.tags.length && a.tags.every((tag, i) => tag === b.tags[i]);
 }
 
+// Compares one field (title, body, or tags) across two normalized documents.
+// Tags are compared as the normalized whole set (already sorted arrays).
+function fieldEqual(a, b) {
+  if (Array.isArray(a) || Array.isArray(b)) {
+    return a.length === b.length && a.every((value, i) => value === b[i]);
+  }
+  return a === b;
+}
+
+// Builds the per-field conflict list for a three-way merge of one document.
+// `base` is the pre-edit snapshot, `incoming` the offline-edited snapshot, and
+// `current` the live online state. Returns `{ result, fields }` where `fields`
+// lists the fields that differ on both sides (empty when the merge is clean).
+function mergeFields(base, incoming, current) {
+  const result = { id: current.id, title: current.title, body: current.body, tags: [...current.tags] };
+  const fields = new Set();
+  for (const field of ['title', 'body', 'tags']) {
+    const baseValue = field === 'tags' ? base.tags : base[field];
+    const incomingValue = field === 'tags' ? incoming.tags : incoming[field];
+    const currentValue = field === 'tags' ? current.tags : current[field];
+    if (fieldEqual(baseValue, incomingValue)) continue; // offline untouched
+    if (fieldEqual(currentValue, baseValue)) {
+      // Online untouched: take the offline value.
+      result[field] = field === 'tags' ? [...incomingValue] : incomingValue;
+    } else if (fieldEqual(currentValue, incomingValue)) {
+      // Both sides changed to the same value: keep it.
+    } else {
+      fields.add(field);
+    }
+  }
+  return { result, fields };
+}
+
 export class Workspace {
   #documents = new Map();
 
@@ -243,6 +276,113 @@ export class Workspace {
       for (const document of incoming) {
         next.set(document.id, Object.freeze(structuredClone(document)));
       }
+    }
+
+    const snapshot = buildSnapshot(next.values());
+    if (!dryRun) this.#documents = next;
+    return snapshot;
+  }
+
+  // Three-way merge of an offline-edited snapshot (`incoming`) against the
+  // live online state (`this.#documents`), using `base` as the common
+  // ancestor. Each document is compared field-by-field: a field only one side
+  // changed is taken, a field both sides changed to the same value is accepted,
+  // and a field both sides changed differently is a conflict. Deletions and
+  // additions follow the same rules. Throws RECONCILE_CONFLICT with a
+  // deduplicated, code-point-sorted conflict list when any field or add/delete
+  // conflict exists; title duplicates are reported only when no such conflict
+  // exists. Returns the result snapshot.
+  reconcile(baseData, incomingData, options = {}) {
+    if (!options || typeof options !== 'object' || Array.isArray(options)) {
+      throw new SnapshotError('INVALID_OPTIONS', 'reconcile options must be an object');
+    }
+    for (const key of Object.keys(options)) {
+      if (key !== 'dryRun') throw new SnapshotError('INVALID_OPTIONS', `unknown reconcile option: ${key}`);
+    }
+    const dryRun = options.dryRun === undefined ? false : options.dryRun;
+    if (typeof dryRun !== 'boolean') {
+      throw new SnapshotError('INVALID_OPTIONS', 'dryRun must be a boolean');
+    }
+
+    const base = normalizeSnapshot(baseData);
+    const incoming = normalizeSnapshot(incomingData);
+
+    const baseMap = new Map(base.map((document) => [document.id, document]));
+    const incomingMap = new Map(incoming.map((document) => [document.id, document]));
+    const next = new Map();
+    const conflicts = [];
+
+    const allIds = new Set([...baseMap.keys(), ...incomingMap.keys(), ...this.#documents.keys()]);
+
+    for (const id of allIds) {
+      const b = baseMap.get(id);
+      const i = incomingMap.get(id);
+      const c = this.#documents.get(id);
+
+      if (b && i && c) {
+        // Three-way field merge on a document present on all sides.
+        const { result, fields } = mergeFields(b, i, c);
+        if (fields.size > 0) {
+          conflicts.push({ id, fields: [...fields].sort(compareCodePoints) });
+        } else {
+          next.set(id, Object.freeze(result));
+        }
+      } else if (b && i && !c) {
+        // Online deleted; offline may have modified.
+        if (sameDocument(b, i)) {
+          // Offline untouched: accept the deletion.
+        } else {
+          conflicts.push({ id, fields: ['document'] });
+        }
+      } else if (b && !i && c) {
+        // Offline deleted; online may have modified.
+        if (sameDocument(b, c)) {
+          // Online untouched: accept the deletion.
+        } else {
+          conflicts.push({ id, fields: ['document'] });
+        }
+      } else if (b && !i && !c) {
+        // Both sides deleted: accept.
+      } else if (!b && i && c) {
+        // Both sides added the same id.
+        if (sameDocument(i, c)) {
+          next.set(id, Object.freeze({ id, title: c.title, body: c.body, tags: [...c.tags] }));
+        } else {
+          conflicts.push({ id, fields: ['document'] });
+        }
+      } else if (!b && i && !c) {
+        // Only offline added: keep.
+        next.set(id, Object.freeze({ id, title: i.title, body: i.body, tags: [...i.tags] }));
+      } else if (!b && !i && c) {
+        // Only online added: keep.
+        next.set(id, Object.freeze({ id, title: c.title, body: c.body, tags: [...c.tags] }));
+      }
+    }
+
+    if (conflicts.length > 0) {
+      conflicts.sort((a, b) => compareCodePoints(a.id, b.id));
+      throw new SnapshotError('RECONCILE_CONFLICT', 'reconcile conflicts detected', { conflicts });
+    }
+
+    // Title uniqueness: final titles must be unique (swaps are allowed).
+    const titleOwners = new Map();
+    const duplicatedTitles = new Set();
+    for (const document of next.values()) {
+      if (titleOwners.has(document.title)) {
+        duplicatedTitles.add(document.title);
+      } else {
+        titleOwners.set(document.title, document.id);
+      }
+    }
+    if (duplicatedTitles.size > 0) {
+      const titleConflicts = [];
+      for (const document of next.values()) {
+        if (duplicatedTitles.has(document.title)) {
+          titleConflicts.push({ id: document.id, fields: ['title'] });
+        }
+      }
+      titleConflicts.sort((a, b) => compareCodePoints(a.id, b.id));
+      throw new SnapshotError('RECONCILE_CONFLICT', 'title conflicts detected', { conflicts: titleConflicts });
     }
 
     const snapshot = buildSnapshot(next.values());
