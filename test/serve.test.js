@@ -4,7 +4,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import test from 'node:test';
-import { Workspace } from '../src/workspace.js';
+import { Workspace, snapshotFromDocuments } from '../src/workspace.js';
+import { HistoryStore } from '../src/history.js';
 
 const CLI = path.resolve('src/cli.js');
 
@@ -429,4 +430,401 @@ test('request bodies over 1 MiB are rejected with 413', async () => {
   } finally {
     await server.stop();
   }
+});
+
+function historyPaths(cwd) {
+  return { snapshot: path.join(cwd, 'snap.json'), history: path.join(cwd, 'history.json') };
+}
+
+function startHistory(cwd, extraArgs = []) {
+  const { snapshot, history } = historyPaths(cwd);
+  return startServer([snapshot, '--history', history, '--port', '0', ...extraArgs]);
+}
+
+test('history: existing documents get revision 1 baselines and the file appears on first write', async () => {
+  const cwd = tempDir();
+  writeSnapshot(path.join(cwd, 'snap.json'), workspaceWith([
+    { id: 'a', title: 'Alpha', body: 'a body [[b]]', tags: ['One'] },
+    { id: 'b', title: 'Beta', body: 'b body', tags: [] },
+  ]));
+  const { history } = historyPaths(cwd);
+  const server = await startHistory(cwd);
+  try {
+    const rows = await request(server.url, 'GET', '/documents/a/history');
+    assert.equal(rows.status, 200);
+    assert.deepEqual(rows.body, [
+      { revision: 1, action: 'baseline', document: { id: 'a', title: 'Alpha', body: 'a body [[b]]', tags: ['one'] } },
+    ]);
+    assert.deepEqual((await request(server.url, 'GET', '/documents/b/history')).body[0].action, 'baseline');
+    // The history file is created by the first successful write, not at startup.
+    assert.ok(!fs.existsSync(history));
+    const listed = await request(server.url, 'GET', '/documents');
+    const changed = await request(server.url, 'PUT', '/documents/b', {
+      body: { id: 'b', title: 'Beta', body: 'b body v2', tags: [] },
+      headers: { 'if-match': listed.etag },
+    });
+    assert.equal(changed.status, 200);
+    assert.ok(fs.existsSync(history));
+  } finally {
+    await server.stop();
+  }
+});
+
+test('history: revisions are consecutive per document through create, replace, delete, recreate', async () => {
+  const cwd = tempDir();
+  const server = await startHistory(cwd);
+  try {
+    let et = (await request(server.url, 'GET', '/documents')).etag;
+    const actions = [];
+    const write = async (response, label) => { actions.push([label, response.status]); et = response.status < 400 ? response.etag : et; };
+
+    await write(await request(server.url, 'POST', '/documents', {
+      body: { id: 'a', title: 'A', body: 'one [[b]]', tags: ['X'] }, headers: { 'if-match': et },
+    }), 'create');
+    // A failed validation does not consume a revision.
+    await write(await request(server.url, 'POST', '/documents', {
+      body: { id: 'a', title: 'Dup', body: 'x', tags: [] }, headers: { 'if-match': et },
+    }), 'dup');
+    await write(await request(server.url, 'PUT', '/documents/a', {
+      body: { id: 'a', title: 'A', body: 'two', tags: ['x', 'y'] }, headers: { 'if-match': et },
+    }), 'replace');
+    // A normalized-identical replace succeeds but appends nothing.
+    const noop = await request(server.url, 'PUT', '/documents/a', {
+      body: { id: 'a', title: '  A  ', body: 'two', tags: [' Y ', 'X', 'x'] }, headers: { 'if-match': et },
+    });
+    assert.equal(noop.status, 200);
+    await write(await request(server.url, 'DELETE', '/documents/a', { headers: { 'if-match': et } }), 'delete');
+    await write(await request(server.url, 'POST', '/documents', {
+      body: { id: 'a', title: 'A reborn', body: 'three', tags: [] }, headers: { 'if-match': et },
+    }), 'recreate');
+
+    const rows = (await request(server.url, 'GET', '/documents/a/history')).body;
+    assert.deepEqual(rows.map((entry) => entry.revision), [1, 2, 3, 4]);
+    assert.deepEqual(rows.map((entry) => entry.action), ['create', 'replace', 'delete', 'create']);
+    assert.equal(rows[2].document, null);
+    assert.deepEqual(rows[0].document, { id: 'a', title: 'A', body: 'one [[b]]', tags: ['x'] });
+    assert.deepEqual(rows[1].document.tags, ['x', 'y']);
+    assert.deepEqual(rows[3].document.body, 'three');
+
+    // A document that never existed is 404; deleted documents stay readable.
+    assert.equal((await request(server.url, 'GET', '/documents/ghost/history')).body.code, 'NOT_FOUND');
+  } finally {
+    await server.stop();
+  }
+});
+
+test('history: restore revives revisions, including deleted documents, and appends a restore record', async () => {
+  const cwd = tempDir();
+  const server = await startHistory(cwd);
+  try {
+    let et = (await request(server.url, 'GET', '/documents')).etag;
+    const send = async (method, route, body) => {
+      const response = await request(server.url, method, route, { body, headers: { 'if-match': et } });
+      if (response.status < 400) et = response.etag;
+      return response;
+    };
+    await send('POST', '/documents', { id: 'b', title: 'B', body: 'owns title', tags: [] });
+    await send('POST', '/documents', { id: 'a', title: 'A', body: 'v1 [[b]]', tags: ['One'] });
+    await send('PUT', '/documents/a', { id: 'a', title: 'A2', body: 'v2', tags: ['two'] });
+    await send('DELETE', '/documents/a');
+    assert.equal((await request(server.url, 'GET', '/documents/a')).status, 404);
+
+    // Restoring a delete revision is 400.
+    const rows = (await request(server.url, 'GET', '/documents/a/history')).body;
+    const deleteRevision = rows.find((entry) => entry.action === 'delete').revision;
+    const badDelete = await send('POST', '/documents/a/restore', { revision: deleteRevision });
+    assert.equal(badDelete.status, 400);
+    assert.equal(badDelete.body.code, 'INVALID_REVISION');
+
+    // An unknown revision number is 404.
+    const unknown = await send('POST', '/documents/a/restore', { revision: 99 });
+    assert.equal(unknown.status, 404);
+    assert.equal(unknown.body.code, 'NOT_FOUND');
+
+    // Restore revision 1 even though the document is deleted.
+    const restored = await send('POST', '/documents/a/restore', { revision: 1 });
+    assert.equal(restored.status, 200);
+    assert.equal(restored.etag, `"${restored.body.checksum}"`);
+    const doc = await request(server.url, 'GET', '/documents/a');
+    assert.deepEqual(doc.body, { id: 'a', title: 'A', body: 'v1 [[b]]', tags: ['one'] });
+
+    // Old records are untouched; a restore record was appended.
+    const after = (await request(server.url, 'GET', '/documents/a/history')).body;
+    assert.deepEqual(after.map((entry) => entry.action), ['create', 'replace', 'delete', 'restore']);
+    assert.equal(after[after.length - 1].revision, 4);
+    assert.deepEqual(after[after.length - 1].document.body, 'v1 [[b]]');
+
+    // Search and links follow the restored content.
+    assert.deepEqual((await request(server.url, 'GET', '/search?q=v2')).body.map((d) => d.id), []);
+    const links = await request(server.url, 'GET', '/documents/a/links');
+    assert.deepEqual(links.body, { outgoing: ['b'], incoming: [] });
+
+    // Restoring the already-current revision succeeds but appends no record.
+    const sameAgain = await send('POST', '/documents/a/restore', { revision: 4 });
+    assert.equal(sameAgain.status, 200);
+    assert.equal((await request(server.url, 'GET', '/documents/a/history')).body.length, 4);
+
+    // A living document holding the target title makes restore conflict.
+    await send('DELETE', '/documents/a');
+    const claimant = await send('POST', '/documents', { id: 'c', title: 'A', body: 'holds A', tags: [] });
+    assert.equal(claimant.status, 201);
+    const conflict = await send('POST', '/documents/a/restore', { revision: 1 });
+    assert.equal(conflict.status, 409);
+    assert.equal(conflict.body.code, 'CONFLICT');
+    // Freeing the title lets the restore revive the deleted document.
+    await send('DELETE', '/documents/c');
+    const revived = await send('POST', '/documents/a/restore', { revision: 1 });
+    assert.equal(revived.status, 200);
+    assert.equal((await request(server.url, 'GET', '/documents/a')).body.title, 'A');
+  } finally {
+    await server.stop();
+  }
+});
+
+test('history: restore validates the request body and reports title conflicts', async () => {
+  const cwd = tempDir();
+  writeSnapshot(path.join(cwd, 'snap.json'), workspaceWith([
+    { id: 'a', title: 'A', body: 'a body', tags: [] },
+    { id: 'b', title: 'Taken', body: 'b body', tags: [] },
+  ]));
+  const server = await startHistory(cwd);
+  try {
+    let et = (await request(server.url, 'GET', '/documents')).etag;
+    const restore = async (payload, { raw = false } = {}) => {
+      const response = await request(server.url, 'POST', '/documents/a/restore', raw
+        ? { rawBody: payload, headers: { 'if-match': et } }
+        : { body: payload, headers: { 'if-match': et } });
+      if (response.status < 400) et = response.etag;
+      return response;
+    };
+    for (const bad of [
+      JSON.stringify('{bad'),
+      { revision: '1' },
+      { revision: 0 },
+      { revision: -1 },
+      { revision: 1.5 },
+      { revision: true },
+      { revision: null },
+      {},
+      { revision: 1, force: true },
+      [1],
+      1,
+    ]) {
+      const response = typeof bad === 'string'
+        ? await restore(bad, { raw: true })
+        : await restore(bad);
+      assert.equal(response.status, 400, JSON.stringify(bad));
+      assert.equal(response.body.code, 'INVALID_REVISION', JSON.stringify(bad));
+    }
+
+    // Restore still honors If-Match.
+    const noMatch = await request(server.url, 'POST', '/documents/a/restore', { body: { revision: 1 } });
+    assert.equal(noMatch.status, 428);
+    const malformed = await request(server.url, 'POST', '/documents/a/restore', {
+      body: { revision: 1 }, headers: { 'if-match': 'garbage' },
+    });
+    assert.equal(malformed.status, 400);
+    const stale = await request(server.url, 'POST', '/documents/a/restore', {
+      body: { revision: 1 }, headers: { 'if-match': `"${'0'.repeat(64)}"` },
+    });
+    assert.equal(stale.status, 412);
+
+    // Give a a revision whose title clashes with b, then restore into it.
+    const clash = await request(server.url, 'PUT', '/documents/a', {
+      body: { id: 'a', title: 'Taken', body: 'clash', tags: [] },
+      headers: { 'if-match': et },
+    });
+    assert.equal(clash.status, 409);
+    assert.equal(clash.body.code, 'CONFLICT');
+  } finally {
+    await server.stop();
+  }
+});
+
+test('history: restore survives a restart and keeps the revision chain', async () => {
+  const cwd = tempDir();
+  const server = await startHistory(cwd);
+  let etag;
+  try {
+    etag = (await request(server.url, 'GET', '/documents')).etag;
+    const send = async (method, route, body) => {
+      const response = await request(server.url, method, route, { body, headers: { 'if-match': etag } });
+      etag = response.etag;
+      return response;
+    };
+    await send('POST', '/documents', { id: 'a', title: 'A', body: 'v1', tags: [] });
+    await send('PUT', '/documents/a', { id: 'a', title: 'A', body: 'v2', tags: [] });
+    await send('DELETE', '/documents/a');
+    await send('POST', '/documents/a/restore', { revision: 2 });
+  } finally {
+    await server.stop();
+  }
+
+  const restarted = await startHistory(cwd);
+  try {
+    const doc = await request(restarted.url, 'GET', '/documents/a');
+    assert.equal(doc.status, 200);
+    assert.equal(doc.body.body, 'v2');
+    const rows = (await request(restarted.url, 'GET', '/documents/a/history')).body;
+    assert.deepEqual(rows.map((entry) => [entry.revision, entry.action]), [
+      [1, 'create'], [2, 'replace'], [3, 'delete'], [4, 'restore'],
+    ]);
+    assert.equal(rows[3].document.body, 'v2');
+  } finally {
+    await restarted.stop();
+  }
+});
+
+test('history: a failed two-file save returns 500 and keeps memory and both files intact', async () => {
+  const cwd = tempDir();
+  const { snapshot, history } = historyPaths(cwd);
+  // The history directory never exists: startup baselines in memory, and the
+  // first commit fails while staging the history file.
+  const server = await startServer([snapshot, '--history', path.join(cwd, 'no-such-dir', 'history.json'), '--port', '0']);
+  try {
+    const empty = await request(server.url, 'GET', '/documents');
+    const failed = await request(server.url, 'POST', '/documents', {
+      body: { id: 'a', title: 'A', body: 'body', tags: [] },
+      headers: { 'if-match': empty.etag },
+    });
+    assert.equal(failed.status, 500);
+    assert.equal(failed.body.code, 'IO_ERROR');
+    assert.ok(!fs.existsSync(snapshot));
+    assert.ok(!fs.existsSync(history));
+
+    const listed = await request(server.url, 'GET', '/documents');
+    assert.deepEqual(listed.body, []);
+    assert.equal(listed.etag, empty.etag);
+    assert.equal((await request(server.url, 'GET', '/documents/a/history')).status, 404);
+  } finally {
+    await server.stop();
+  }
+});
+
+test('serve rejects identical snapshot/history paths and bad history files', async () => {
+  const cwd = tempDir();
+
+  const same = path.join(cwd, 'both.json');
+  const samePath = await startServerFailure([same, '--history', same, '--port', '0']);
+  assert.equal(samePath.status, 1);
+  assert.equal(samePath.stdout, '');
+  assert.equal(JSON.parse(samePath.stderr.trim()).code, 'INVALID_OPTIONS');
+
+  const directory = path.join(cwd, 'history-dir');
+  fs.mkdirSync(directory);
+  const unreadable = await startServerFailure([
+    path.join(cwd, 'snap.json'), '--history', directory, '--port', '0',
+  ]);
+  assert.equal(unreadable.status, 1);
+  assert.equal(JSON.parse(unreadable.stderr.trim()).code, 'IO_ERROR');
+
+  const corrupt = path.join(cwd, 'corrupt-history.json');
+  fs.writeFileSync(corrupt, '{broken json');
+  const invalid = await startServerFailure([
+    path.join(cwd, 'snap.json'), '--history', corrupt, '--port', '0',
+  ]);
+  assert.equal(invalid.status, 1);
+  assert.equal(invalid.stdout, '');
+  assert.equal(JSON.parse(invalid.stderr.trim()).code, 'INVALID_HISTORY');
+  assert.equal(fs.readFileSync(corrupt, 'utf8'), '{broken json');
+});
+
+test('serve without --history keeps the original behavior and exposes no history routes', async () => {
+  const cwd = tempDir();
+  const server = await startServer([path.join(cwd, 'snap.json'), '--port', '0']);
+  try {
+    const et = (await request(server.url, 'GET', '/documents')).etag;
+    await request(server.url, 'POST', '/documents', {
+      body: { id: 'a', title: 'A', body: 'body', tags: [] },
+      headers: { 'if-match': et },
+    });
+    assert.equal((await request(server.url, 'GET', '/documents/a/history')).body.code, 'NOT_FOUND');
+    const restore = await request(server.url, 'POST', '/documents/a/restore', {
+      body: { revision: 1 }, headers: { 'if-match': (await request(server.url, 'GET', '/documents')).etag },
+    });
+    assert.equal(restore.status, 404);
+  } finally {
+    await server.stop();
+  }
+});
+
+// Builds committed snapshot/history file pairs for a small history so crash
+// windows can be simulated by arranging the files before a restart.
+function committedPair(documents, mutate) {
+  let store = HistoryStore.baseline(documents.map((d) => structuredClone(d)));
+  if (mutate) {
+    store = store.clone();
+    mutate(store);
+  }
+  const snapshot = snapshotFromDocuments(store.replayedDocuments().values());
+  return { snapshot, history: store.exportJSON(snapshot.checksum) };
+}
+
+test('history: restart after a kill between the two file installs presents a whole state', async () => {
+  const cwd = tempDir();
+  const { snapshot: snapshotPath, history: historyPath } = historyPaths(cwd);
+  const backupPath = `${historyPath}.bak`;
+  const baseDocuments = [{ id: 'a', title: 'A', body: 'OLD', tags: [] }];
+
+  const before = committedPair(baseDocuments);
+  const after = committedPair(baseDocuments, (store) => {
+    store.record('a', 'replace', { id: 'a', title: 'A', body: 'NEW', tags: [] });
+  });
+
+  // Window A: the old history was moved aside and the new one not yet put in
+  // place (only the backup exists) — restart must show the pre-commit state.
+  fs.writeFileSync(snapshotPath, JSON.stringify(before.snapshot));
+  fs.writeFileSync(backupPath, JSON.stringify(before.history));
+  let server = await startHistory(cwd);
+  try {
+    const doc = await request(server.url, 'GET', '/documents/a');
+    assert.equal(doc.body.body, 'OLD');
+    assert.ok(!fs.existsSync(backupPath));
+  } finally {
+    await server.stop();
+  }
+
+  // Window B: the new history landed but the snapshot rename had not run — the
+  // acknowledged (post-commit) state must be reconstructed and presented.
+  fs.writeFileSync(snapshotPath, JSON.stringify(before.snapshot));
+  fs.writeFileSync(historyPath, JSON.stringify(after.history));
+  fs.writeFileSync(backupPath, JSON.stringify(before.history));
+  server = await startHistory(cwd);
+  try {
+    const doc = await request(server.url, 'GET', '/documents/a');
+    assert.equal(doc.body.body, 'NEW');
+    // The snapshot file is rebuilt and both files agree.
+    const onDisk = JSON.parse(fs.readFileSync(snapshotPath, 'utf8'));
+    assert.equal(onDisk.checksum, after.snapshot.checksum);
+    assert.equal(JSON.parse(fs.readFileSync(historyPath, 'utf8')).snapshot, after.snapshot.checksum);
+    assert.ok(!fs.existsSync(backupPath));
+    // Further commits continue from the reconstructed state.
+    const et = doc.etag;
+    const next = await request(server.url, 'PUT', '/documents/a', {
+      body: { id: 'a', title: 'A', body: 'NEWER', tags: [] },
+      headers: { 'if-match': et },
+    });
+    assert.equal(next.status, 200);
+    const rows = (await request(server.url, 'GET', '/documents/a/history')).body;
+    assert.deepEqual(rows.map((entry) => [entry.revision, entry.action]), [
+      [1, 'baseline'], [2, 'replace'], [3, 'replace'],
+    ]);
+  } finally {
+    await server.stop();
+  }
+});
+
+test('history: a history that cannot replay to its embedded snapshot is INVALID_HISTORY', async () => {
+  const cwd = tempDir();
+  const { snapshot: snapshotPath, history: historyPath } = historyPaths(cwd);
+  const pair = committedPair([{ id: 'a', title: 'A', body: 'body', tags: [] }]);
+  fs.writeFileSync(snapshotPath, JSON.stringify(pair.snapshot));
+  // Hand-edit an entry without updating the checksum chain.
+  const broken = structuredClone(pair.history);
+  broken.history.a[0].document.body = 'tampered';
+  fs.writeFileSync(historyPath, JSON.stringify(broken));
+  const failed = await startServerFailure([snapshotPath, '--history', historyPath, '--port', '0']);
+  assert.equal(failed.status, 1);
+  assert.equal(failed.stdout, '');
+  assert.equal(JSON.parse(failed.stderr.trim()).code, 'INVALID_HISTORY');
 });

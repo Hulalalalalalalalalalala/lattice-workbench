@@ -57,6 +57,13 @@ function buildSnapshot(documents) {
   return { version: SNAPSHOT_VERSION, documents: canonical, checksum: hashDocuments(canonical) };
 }
 
+// Builds a version-1 snapshot from any iterable of normalized documents.
+// Exported so the history ledger can derive the same checksum the workspace
+// would produce without instantiating one.
+export function snapshotFromDocuments(documents) {
+  return buildSnapshot(documents);
+}
+
 function sameKeys(object, expected) {
   const keys = Object.keys(object);
   return keys.length === expected.length && expected.every((key) => keys.includes(key));

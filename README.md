@@ -99,7 +99,7 @@ same path as `base` (the file is replaced atomically via a staging file).
 ### `serve` command
 
 ```bash
-node src/cli.js serve <snapshot> [--port <port>]
+node src/cli.js serve <snapshot> [--port <port>] [--history <file>]
 ```
 
 Serves one workspace over HTTP on `127.0.0.1` (default port `3000`; `--port 0`
@@ -131,3 +131,51 @@ exactly one JSON line with the actual address, e.g.
   case-sensitive), missing documents `404`, a path/body id mismatch or invalid
   JSON/document fields `400`, and bodies over 1 MiB `413`. Every failure
   response carries a stable `code` and never changes the stored content.
+
+#### Persistent history (`--history <file>`)
+
+Passing `--history <file>` enables a durable, per-document revision ledger in
+addition to the version-1 content snapshot. Without it the server behaves
+exactly as before and the history routes are absent.
+
+- On first use, every document already in the snapshot receives a revision 1
+  `baseline` record; documents created later start at revision 1 with a
+  `create`. Revisions are consecutive per document across `create`, `replace`,
+  `delete`, and `restore`. Recreating a previously deleted id keeps counting
+  upward. Failed requests never consume a revision, and a `replace` or
+  `restore` whose normalized content is unchanged still returns `200` but does
+  not append a record (and does not touch the files).
+- The history file is created by the first successful write, not at startup.
+  It is a checksummed JSON document (`version`, `history`, `snapshot`,
+  `checksum`) whose `snapshot` field binds the ledger to the checksum of the
+  current content snapshot; the version-1 snapshot format and the JSON
+  migration paths are unchanged and never carry history data.
+- `GET /documents/:id/history` returns the document's records in ascending
+  `revision` order, each `{ revision, action, document }` with `action` one of
+  `baseline/create/replace/delete/restore`. The `document` is the full
+  document as it existed at that revision, or `null` for a `delete` record.
+  Deleted documents remain queryable; an id that never existed returns
+  `404`/`NOT_FOUND`.
+- `POST /documents/:id/restore` takes `{ "revision": n }` and restores that
+  revision's title, body, and tags — including for a currently deleted
+  document. It answers `200` with the current snapshot and its `ETag`, leaves
+  all older records intact, and appends a new `restore` record. It applies the
+  same `If-Match` precondition and 1 MiB body limit as other writes.
+  - `404`/`NOT_FOUND`: the document never existed, or the revision does not.
+  - `400`/`INVALID_REVISION`: the body is not an object containing only a
+    positive integer `revision`, or the selected revision is a `delete`.
+  - `409`/`CONFLICT`: the restored title clashes with another document.
+  - Restore never edits another document's body; search and bidirectional
+    links follow the current content.
+- Content snapshot and history are committed together: the history file is
+  installed first (embedding the new content checksum), then the snapshot. If
+  the process is killed mid-commit, restart lands entirely on the pre-commit
+  or the post-commit state; a kill after success is acknowledged is always
+  reconstructed from the ledger. Any save failure answers `500`/`IO_ERROR` and
+  leaves in-memory state, query results, history, and both files as they were.
+- Startup errors exit `1` after writing exactly one JSON line containing a
+  `code` to standard error, leaving the files untouched:
+  - `INVALID_OPTIONS`: the snapshot and history paths resolve to the same file.
+  - `IO_ERROR`: an existing history file cannot be read.
+  - `INVALID_HISTORY`: the history is corrupt, or it cannot be reconciled to a
+    single consistent state with the snapshot.

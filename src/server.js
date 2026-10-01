@@ -1,5 +1,6 @@
 import http from 'node:http';
 import { SnapshotError, Workspace } from './workspace.js';
+import { sameDocument } from './history.js';
 
 const MAX_BODY_BYTES = 1024 * 1024;
 const ETAG_PATTERN = /^"[0-9a-f]{64}"$/u;
@@ -71,11 +72,15 @@ function validateDocument(data) {
   return { id: data.id, title: data.title, body: data.body, tags: data.tags ?? [] };
 }
 
-// A document server holds one Workspace and persists every committed change
-// through `save(snapshot)` before the in-memory state is swapped, so a failed
-// save leaves memory, queries, and the original file untouched.
-export function createDocumentServer({ workspace, save }) {
+// A document server holds one Workspace and, when a history store is supplied,
+// a per-document revision ledger. Every committed change is persisted through
+// `save(snapshot, historySnapshot)` before the in-memory state is swapped, so a
+// failed save leaves memory, queries, history, and the original files
+// untouched. Everything here is synchronous, so a commit is atomic with
+// respect to other requests.
+export function createDocumentServer({ workspace, save, history = null }) {
   let current = workspace;
+  let ledger = history;
 
   const currentEtag = () => `"${current.exportJSON().checksum}"`;
 
@@ -101,16 +106,22 @@ export function createDocumentServer({ workspace, save }) {
     }
   }
 
-  // Builds the next state on a candidate workspace, persists its version-1
-  // snapshot, and only then installs it. Everything here is synchronous, so a
-  // commit is atomic with respect to other requests.
+  // Builds the next state on a candidate workspace and lets `mutate` append to
+  // the next ledger. The callback returns false to signal a content-preserving
+  // write (normalized content unchanged): the request still succeeds, but no
+  // revision is appended and nothing is persisted.
   function commit(mutate) {
     const candidate = new Workspace();
     for (const document of current.list()) candidate.add(document);
-    mutate(candidate);
+    const nextLedger = ledger ? ledger.clone() : null;
+    const changed = mutate(candidate, nextLedger);
+    if (changed === false) {
+      return current.exportJSON();
+    }
     const snapshot = candidate.exportJSON();
-    save(snapshot);
+    save(snapshot, nextLedger ? nextLedger.exportJSON(snapshot.checksum) : null);
     current = candidate;
+    ledger = nextLedger;
     return snapshot;
   }
 
@@ -118,12 +129,13 @@ export function createDocumentServer({ workspace, save }) {
     const text = await readBody(req);
     requireIfMatch(req);
     const document = validateDocument(parseJson(text));
-    const snapshot = commit((candidate) => {
+    const snapshot = commit((candidate, nextLedger) => {
       if (candidate.get(document.id)) {
         throw new HttpError(409, 'CONFLICT', `document already exists: ${document.id}`);
       }
       assertTitleFree(candidate, document.title);
       candidate.add(document);
+      if (nextLedger) nextLedger.record(document.id, 'create', candidate.get(document.id));
     });
     sendJson(res, 201, snapshot, `"${snapshot.checksum}"`);
   }
@@ -138,10 +150,17 @@ export function createDocumentServer({ workspace, save }) {
     if (!current.get(id)) {
       throw new HttpError(404, 'NOT_FOUND', `document not found: ${id}`);
     }
-    const snapshot = commit((candidate) => {
+    const before = current.get(id);
+    const snapshot = commit((candidate, nextLedger) => {
       candidate.remove(id);
       assertTitleFree(candidate, document.title);
       candidate.add(document);
+      const stored = candidate.get(id);
+      // A replace whose normalized content is identical succeeds without
+      // consuming a revision or touching the files.
+      if (sameDocument(before, stored)) return false;
+      if (nextLedger) nextLedger.record(id, 'replace', stored);
+      return true;
     });
     sendJson(res, 200, snapshot, `"${snapshot.checksum}"`);
   }
@@ -151,8 +170,52 @@ export function createDocumentServer({ workspace, save }) {
     if (!current.get(id)) {
       throw new HttpError(404, 'NOT_FOUND', `document not found: ${id}`);
     }
-    const snapshot = commit((candidate) => {
+    const snapshot = commit((candidate, nextLedger) => {
       candidate.remove(id);
+      if (nextLedger) nextLedger.record(id, 'delete', null);
+    });
+    sendJson(res, 200, snapshot, `"${snapshot.checksum}"`);
+  }
+
+  function historyDocument(req, res, id) {
+    if (!ledger) throw new HttpError(404, 'NOT_FOUND', `no route for GET /documents/${id}/history`);
+    const entries = ledger.entries(id);
+    if (!entries) throw new HttpError(404, 'NOT_FOUND', `document never existed: ${id}`);
+    sendJson(res, 200, entries, currentEtag());
+  }
+
+  async function restoreDocument(req, res, id) {
+    if (!ledger) throw new HttpError(404, 'NOT_FOUND', `no route for POST /documents/${id}/restore`);
+    const text = await readBody(req);
+    requireIfMatch(req);
+    let data;
+    try {
+      data = JSON.parse(text);
+    } catch {
+      throw new HttpError(400, 'INVALID_REVISION', 'request body must be an object containing only a positive integer revision');
+    }
+    if (!data || typeof data !== 'object' || Array.isArray(data)
+      || Object.keys(data).length !== 1 || !Object.hasOwn(data, 'revision')
+      || !Number.isInteger(data.revision) || data.revision < 1) {
+      throw new HttpError(400, 'INVALID_REVISION', 'request body must be an object containing only a positive integer revision');
+    }
+    const chain = ledger.entries(id);
+    if (!chain) throw new HttpError(404, 'NOT_FOUND', `document never existed: ${id}`);
+    const target = ledger.entry(id, data.revision);
+    if (!target) throw new HttpError(404, 'NOT_FOUND', `unknown revision ${data.revision} for document ${id}`);
+    if (target.action === 'delete') {
+      throw new HttpError(400, 'INVALID_REVISION', `revision ${data.revision} of document ${id} is a delete and cannot be restored`);
+    }
+    const before = current.get(id);
+    const snapshot = commit((candidate, nextLedger) => {
+      candidate.remove(id);
+      assertTitleFree(candidate, target.document.title);
+      candidate.add(target.document);
+      const stored = candidate.get(id);
+      // Restoring the already-current content succeeds without a new record.
+      if (before && sameDocument(before, stored)) return false;
+      nextLedger.record(id, 'restore', stored);
+      return true;
     });
     sendJson(res, 200, snapshot, `"${snapshot.checksum}"`);
   }
@@ -190,6 +253,12 @@ export function createDocumentServer({ workspace, save }) {
       const links = current.links(id);
       if (!links) throw new HttpError(404, 'NOT_FOUND', `document not found: ${id}`);
       sendJson(res, 200, links, currentEtag());
+      return;
+    } else if (resource === 'documents' && segments.length === 3 && relation === 'history' && req.method === 'GET') {
+      historyDocument(req, res, id);
+      return;
+    } else if (resource === 'documents' && segments.length === 3 && relation === 'restore' && req.method === 'POST') {
+      await restoreDocument(req, res, id);
       return;
     } else if (resource === 'search' && segments.length === 1 && req.method === 'GET') {
       sendJson(res, 200, current.search(url.searchParams.get('q') ?? ''), currentEtag());
