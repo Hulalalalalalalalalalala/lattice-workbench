@@ -5,12 +5,12 @@ const SNAPSHOT_VERSION = 1;
 const SNAPSHOT_KEYS = ['version', 'documents', 'checksum'];
 const DOCUMENT_KEYS = ['id', 'title', 'body', 'tags'];
 
-function normalizeTags(tags) {
+export function normalizeTags(tags) {
   if (!Array.isArray(tags)) throw new TypeError('tags must be an array');
   return [...new Set(tags.map((tag) => String(tag).trim().toLowerCase()).filter(Boolean))].sort();
 }
 
-function assertDocument(input) {
+export function assertDocument(input) {
   if (!input || typeof input !== 'object') throw new TypeError('document must be an object');
   for (const key of ['id', 'title', 'body']) {
     if (typeof input[key] !== 'string' || !input[key].trim()) throw new TypeError(`${key} must be a non-empty string`);

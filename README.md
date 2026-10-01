@@ -96,6 +96,61 @@ same path as `base` (the file is replaced atomically via a staging file).
 - Parse failures report `INVALID_SNAPSHOT`; file read/write failures report
   `IO_ERROR`; other codes mirror the API (`IMPORT_CONFLICT`, `INVALID_OPTIONS`).
 
+### `export-md` / `import-md` commands
+
+A version-1 snapshot can also be exchanged as a directory of plain Markdown
+files. Round-tripping a snapshot through the directory format and back
+reproduces the snapshot byte-for-byte, so bodies, search results, and
+outgoing/incoming wiki links are unchanged; an empty workspace round-trips as
+well.
+
+```bash
+node src/cli.js export-md <snapshot> <output-directory>
+node src/cli.js import-md <base> <input-directory> <output> <mode> [--dry-run]
+```
+
+The package directory contains `manifest.json` and one `<id>.md` per document:
+
+- Each `*.md` holds only that document's original UTF-8 body bytes. Newlines
+  and dangling `[[...]]` links are preserved verbatim; nothing is added or
+  escaped.
+- `manifest.json` has exactly `version`, `documents`, and `checksum`, in that
+  order. `version` is `1`; `checksum` is the bound version-1 content snapshot
+  checksum (the same value the JSON snapshot carries).
+- Each document entry has exactly `id`, `title`, `tags`, `file`, and
+  `sha256`. `file` must equal `<id>.md`, and `sha256` is the lowercase-hex
+  SHA-256 of the body file's raw bytes. Entries are sorted by `id` in Unicode
+  code-point order.
+- Repeating an export of the same snapshot writes byte-identical files.
+
+`export-md` prints exactly one line: the manifest JSON (the same bytes written
+to `manifest.json`). An existing target directory is replaced wholesale via a
+sibling staging directory and a single rename, so old files never linger and a
+retry after the process was killed completes a fresh package.
+
+`import-md` normalizes titles and tags under the existing document rules,
+verifies every file digest and the rebuilt snapshot's bound checksum, then
+applies the package to the `base` snapshot: `merge` uses the existing conflict
+and `ids` rules (including `IMPORT_CONFLICT`), while `replace` installs the
+package wholesale. On success it prints one line — the result snapshot JSON,
+the same bytes saved to `output` (which may equal `base`) — and search and
+derived links immediately reflect the result. `--dry-run` runs every
+validation check and prints the projection without creating or modifying the
+output.
+
+Error reporting matches `migrate`: on failure standard output is empty,
+standard error is exactly one JSON line carrying a `code`, the process exits
+`1`, and inputs and any existing output are left untouched.
+
+| Code | When |
+| --- | --- |
+| `INVALID_MARKDOWN` | Manifest version/field/type errors, duplicate ids or normalized titles, illegal UTF-8, a digest or checksum mismatch, a missing or extra file, an un-encodable body on export, or a package whose input directory is itself a symlink or contains a symlink, subdirectory, special file, or illegal file name. |
+| `INVALID_OPTIONS` | Wrong argument count or mode, an unknown flag (including `--dry-run` for `export-md`), an export target that is a symlink or contains the source snapshot, or an import output placed inside the input package. Path aliases are compared by their resolved real locations. |
+| `IO_ERROR` | Any failure reading an input or writing the package/snapshot. |
+
+The package is read strictly: symlinked directories or entries are refused and
+no content outside the directory is ever followed.
+
 ### `serve` command
 
 ```bash

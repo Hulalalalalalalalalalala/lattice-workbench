@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { createDocumentServer } from './server.js';
 import { HistoryStore, loadHistoryFile } from './history.js';
+import { exportMarkdown, importMarkdown } from './markdown-pkg.js';
 import { SnapshotError, Workspace, snapshotFromDocuments } from './workspace.js';
 
 function demo() {
@@ -81,8 +82,48 @@ function migrate(args) {
   process.stdout.write(rendered);
 }
 
-function parsePort(value) {
-  if (!/^\d+$/u.test(value)) {
+function parseMarkdownArgs(args) {
+  const positionals = [];
+  let dryRun = false;
+  for (const arg of args) {
+    if (arg === '--dry-run') {
+      dryRun = true;
+    } else if (arg.startsWith('--')) {
+      throw new SnapshotError('INVALID_OPTIONS', `unknown option: ${arg}`);
+    } else {
+      positionals.push(arg);
+    }
+  }
+  return { positionals, dryRun };
+}
+
+function exportMd(args) {
+  const { positionals, dryRun } = parseMarkdownArgs(args);
+  if (dryRun || positionals.length !== 2) {
+    throw new SnapshotError('INVALID_OPTIONS', 'usage: export-md <snapshot> <output-directory>');
+  }
+  const [snapshot, outputDirectory] = positionals;
+  const { manifestText } = exportMarkdown(snapshot, outputDirectory);
+  process.stdout.write(manifestText);
+}
+
+function importMd(args) {
+  const { positionals, dryRun } = parseMarkdownArgs(args);
+  if (positionals.length !== 4) {
+    throw new SnapshotError(
+      'INVALID_OPTIONS',
+      'usage: import-md <base> <input-directory> <output> <mode> [--dry-run]',
+    );
+  }
+  const [base, inputDirectory, output, mode] = positionals;
+  if (mode !== 'merge' && mode !== 'replace') {
+    throw new SnapshotError('INVALID_OPTIONS', "mode must be 'merge' or 'replace'");
+  }
+  const { snapshot } = importMarkdown(base, inputDirectory, output, mode, dryRun);
+  process.stdout.write(`${JSON.stringify(snapshot)}\n`);
+}
+
+function parsePort(value) {  if (!/^\d+$/u.test(value)) {
     throw new SnapshotError('INVALID_OPTIONS', `invalid port: ${value}`);
   }
   const port = Number(value);
@@ -298,6 +339,18 @@ if (command === 'demo') {
   } catch (error) {
     reportError(error);
   }
+} else if (command === 'export-md') {
+  try {
+    exportMd(process.argv.slice(3));
+  } catch (error) {
+    reportError(error);
+  }
+} else if (command === 'import-md') {
+  try {
+    importMd(process.argv.slice(3));
+  } catch (error) {
+    reportError(error);
+  }
 } else if (command === 'serve') {
   try {
     serve(process.argv.slice(3));
@@ -305,6 +358,6 @@ if (command === 'demo') {
     reportError(error);
   }
 } else {
-  process.stderr.write('Usage: node src/cli.js demo | node src/cli.js migrate <base> <incoming> <output> <mode> [--dry-run] | node src/cli.js serve <snapshot> [--port <port>] [--history <file>]\n');
+  process.stderr.write('Usage: node src/cli.js demo | migrate <base> <incoming> <output> <mode> [--dry-run] | export-md <snapshot> <output-directory> | import-md <base> <input-directory> <output> <mode> [--dry-run] | serve <snapshot> [--port <port>] [--history <file>]\n');
   process.exitCode = 1;
 }
