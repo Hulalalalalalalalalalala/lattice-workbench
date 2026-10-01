@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import fs from 'node:fs';
 import path from 'node:path';
+import { createDocumentServer } from './server.js';
 import { SnapshotError, Workspace } from './workspace.js';
 
 function demo() {
@@ -74,6 +75,62 @@ function migrate(args) {
   process.stdout.write(rendered);
 }
 
+function parsePort(value) {
+  if (!/^\d+$/u.test(value)) {
+    throw new SnapshotError('INVALID_OPTIONS', `invalid port: ${value}`);
+  }
+  const port = Number(value);
+  if (port > 65535) {
+    throw new SnapshotError('INVALID_OPTIONS', `invalid port: ${value}`);
+  }
+  return port;
+}
+
+function parseServeArgs(args) {
+  const positionals = [];
+  let port = 3000;
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index];
+    if (arg === '--port') {
+      index += 1;
+      if (index >= args.length) throw new SnapshotError('INVALID_OPTIONS', '--port requires a value');
+      port = parsePort(args[index]);
+    } else if (arg.startsWith('--port=')) {
+      port = parsePort(arg.slice('--port='.length));
+    } else if (arg.startsWith('--')) {
+      throw new SnapshotError('INVALID_OPTIONS', `unknown option: ${arg}`);
+    } else {
+      positionals.push(arg);
+    }
+  }
+  if (positionals.length !== 1) {
+    throw new SnapshotError('INVALID_OPTIONS', 'usage: serve <snapshot> [--port <port>]');
+  }
+  return { file: positionals[0], port };
+}
+
+function serve(args) {
+  const { file, port } = parseServeArgs(args);
+
+  const workspace = new Workspace();
+  if (fs.existsSync(file)) {
+    // An unreadable or invalid snapshot is fatal; the file is left untouched.
+    workspace.importJSON(readSnapshotFile(file), { mode: 'replace' });
+  }
+
+  const server = createDocumentServer({
+    workspace,
+    save: (snapshot) => atomicWrite(file, `${JSON.stringify(snapshot)}\n`),
+  });
+  server.on('error', (error) => {
+    reportError(new SnapshotError('IO_ERROR', `cannot serve ${file}: ${error.message}`));
+  });
+  server.listen(port, '127.0.0.1', () => {
+    const address = server.address();
+    process.stdout.write(`${JSON.stringify({ host: address.address, port: address.port })}\n`);
+  });
+}
+
 function reportError(error) {
   const payload = { code: error instanceof SnapshotError ? error.code : 'IO_ERROR' };
   if (typeof error.message === 'string') payload.message = error.message;
@@ -91,7 +148,13 @@ if (command === 'demo') {
   } catch (error) {
     reportError(error);
   }
+} else if (command === 'serve') {
+  try {
+    serve(process.argv.slice(3));
+  } catch (error) {
+    reportError(error);
+  }
 } else {
-  process.stderr.write('Usage: node src/cli.js demo | node src/cli.js migrate <base> <incoming> <output> <mode> [--dry-run]\n');
+  process.stderr.write('Usage: node src/cli.js demo | node src/cli.js migrate <base> <incoming> <output> <mode> [--dry-run] | node src/cli.js serve <snapshot> [--port <port>]\n');
   process.exitCode = 1;
 }

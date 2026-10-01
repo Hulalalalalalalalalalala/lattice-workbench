@@ -166,6 +166,10 @@ export class Workspace {
     return document ? structuredClone(document) : null;
   }
 
+  remove(id) {
+    return this.#documents.delete(id);
+  }
+
   list() {
     return [...this.#documents.values()].map((document) => structuredClone(document)).sort((a, b) => a.id.localeCompare(b.id));
   }
