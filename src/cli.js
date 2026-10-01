@@ -4,6 +4,7 @@ import path from 'node:path';
 import { createDocumentServer } from './server.js';
 import { HistoryStore, loadHistoryFile } from './history.js';
 import { SnapshotError, Workspace, snapshotFromDocuments } from './workspace.js';
+import { exportMarkdownPackage, importMarkdownPackage } from './markdown.js';
 
 function demo() {
   const workspace = new Workspace();
@@ -47,6 +48,25 @@ function stagingPath(file) {
   return path.join(directory, `.${path.basename(file)}.${process.pid}.tmp`);
 }
 
+// Resolves a path to its real location, following every symlink that exists;
+// the non-existent tail is appended verbatim. Containment checks use this so
+// path aliases (symlinks, `..`) cannot hide that two paths actually overlap.
+function realPathOf(target) {
+  const resolved = path.resolve(target);
+  const missing = [];
+  let current = resolved;
+  while (true) {
+    try {
+      return path.join(fs.realpathSync(current), ...missing.reverse());
+    } catch {
+      const parent = path.dirname(current);
+      if (parent === current) return path.join(current, ...missing.reverse());
+      missing.push(path.basename(current));
+      current = parent;
+    }
+  }
+}
+
 function parseMigrateArgs(args) {
   const positionals = [];
   let dryRun = false;
@@ -75,6 +95,86 @@ function migrate(args) {
   const workspace = new Workspace();
   workspace.importJSON(readSnapshotFile(base), { mode: 'replace' });
   const snapshot = workspace.importJSON(readSnapshotFile(incoming), { mode, dryRun });
+
+  const rendered = `${JSON.stringify(snapshot)}\n`;
+  if (!dryRun) atomicWrite(output, rendered);
+  process.stdout.write(rendered);
+}
+
+function parseExportMdArgs(args) {
+  const positionals = [];
+  for (const arg of args) {
+    if (arg.startsWith('--')) {
+      throw new SnapshotError('INVALID_OPTIONS', `unknown option: ${arg}`);
+    }
+    positionals.push(arg);
+  }
+  if (positionals.length !== 2) {
+    throw new SnapshotError('INVALID_OPTIONS', 'usage: export-md <snapshot> <output-dir>');
+  }
+  return { snapshotFile: positionals[0], outputDir: positionals[1] };
+}
+
+function exportMd(args) {
+  const { snapshotFile, outputDir } = parseExportMdArgs(args);
+
+  // Option checks run before any I/O. The target must not be a symlink and
+  // must not contain the source snapshot, including through path aliases.
+  if (fs.existsSync(outputDir)) {
+    const stat = fs.lstatSync(outputDir);
+    if (stat.isSymbolicLink()) {
+      throw new SnapshotError('INVALID_OPTIONS', 'output directory must not be a symbolic link');
+    }
+  }
+  const sourceReal = realPathOf(snapshotFile);
+  const outputReal = realPathOf(outputDir);
+  if (sourceReal === outputReal || sourceReal.startsWith(`${outputReal}${path.sep}`)) {
+    throw new SnapshotError('INVALID_OPTIONS', 'output directory must not contain the source snapshot');
+  }
+
+  const workspace = new Workspace();
+  const snapshot = workspace.importJSON(readSnapshotFile(snapshotFile), { mode: 'replace' });
+  const manifest = exportMarkdownPackage(snapshot, outputDir);
+  process.stdout.write(`${JSON.stringify(manifest)}\n`);
+}
+
+function parseImportMdArgs(args) {
+  const positionals = [];
+  let dryRun = false;
+  for (const arg of args) {
+    if (arg === '--dry-run') {
+      dryRun = true;
+    } else if (arg.startsWith('--')) {
+      throw new SnapshotError('INVALID_OPTIONS', `unknown option: ${arg}`);
+    } else {
+      positionals.push(arg);
+    }
+  }
+  if (positionals.length !== 4) {
+    throw new SnapshotError('INVALID_OPTIONS', 'usage: import-md <base> <input-dir> <output> <mode> [--dry-run]');
+  }
+  const [base, inputDir, output, mode] = positionals;
+  if (mode !== 'merge' && mode !== 'replace') {
+    throw new SnapshotError('INVALID_OPTIONS', "mode must be 'merge' or 'replace'");
+  }
+  return { base, inputDir, output, mode, dryRun };
+}
+
+function importMd(args) {
+  const { base, inputDir, output, mode, dryRun } = parseImportMdArgs(args);
+
+  // The output snapshot must not live inside the package directory, including
+  // through path aliases; the package itself is never written to.
+  const inputReal = realPathOf(inputDir);
+  const outputReal = realPathOf(output);
+  if (outputReal === inputReal || outputReal.startsWith(`${inputReal}${path.sep}`)) {
+    throw new SnapshotError('INVALID_OPTIONS', 'output snapshot must not be inside the input directory');
+  }
+
+  const workspace = new Workspace();
+  workspace.importJSON(readSnapshotFile(base), { mode: 'replace' });
+  const incoming = importMarkdownPackage(inputDir);
+  const snapshot = workspace.importJSON(incoming, { mode, dryRun });
 
   const rendered = `${JSON.stringify(snapshot)}\n`;
   if (!dryRun) atomicWrite(output, rendered);
@@ -298,6 +398,18 @@ if (command === 'demo') {
   } catch (error) {
     reportError(error);
   }
+} else if (command === 'export-md') {
+  try {
+    exportMd(process.argv.slice(3));
+  } catch (error) {
+    reportError(error);
+  }
+} else if (command === 'import-md') {
+  try {
+    importMd(process.argv.slice(3));
+  } catch (error) {
+    reportError(error);
+  }
 } else if (command === 'serve') {
   try {
     serve(process.argv.slice(3));
@@ -305,6 +417,6 @@ if (command === 'demo') {
     reportError(error);
   }
 } else {
-  process.stderr.write('Usage: node src/cli.js demo | node src/cli.js migrate <base> <incoming> <output> <mode> [--dry-run] | node src/cli.js serve <snapshot> [--port <port>] [--history <file>]\n');
+  process.stderr.write('Usage: node src/cli.js demo | node src/cli.js migrate <base> <incoming> <output> <mode> [--dry-run] | node src/cli.js export-md <snapshot> <output-dir> | node src/cli.js import-md <base> <input-dir> <output> <mode> [--dry-run] | node src/cli.js serve <snapshot> [--port <port>] [--history <file>]\n');
   process.exitCode = 1;
 }
