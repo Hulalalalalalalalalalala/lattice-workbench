@@ -828,3 +828,520 @@ test('history: a history that cannot replay to its embedded snapshot is INVALID_
   assert.equal(failed.stdout, '');
   assert.equal(JSON.parse(failed.stderr.trim()).code, 'INVALID_HISTORY');
 });
+
+test('batch: mixed operations commit atomically and queries reflect the whole batch', async () => {
+  const cwd = tempDir();
+  const file = path.join(cwd, 'snap.json');
+  writeSnapshot(file, workspaceWith([
+    { id: 'a', title: 'Alpha', body: 'links [[b]]', tags: ['One'] },
+    { id: 'b', title: 'Beta', body: 'markdown body', tags: [] },
+  ]));
+  const server = await startServer([file, '--port', '0']);
+  try {
+    const before = await request(server.url, 'GET', '/documents');
+    const result = await request(server.url, 'POST', '/batch', {
+      body: {
+        operations: [
+          { type: 'create', document: { id: 'c', title: 'Gamma', body: 'fresh [[a]]', tags: ['New'] } },
+          { type: 'replace', document: { id: 'a', title: 'Alpha v2', body: 'now links [[c]]', tags: [] } },
+          { type: 'delete', id: 'b' },
+        ],
+      },
+      headers: { 'if-match': before.etag },
+    });
+    assert.equal(result.status, 200);
+    assert.equal(result.etag, `"${result.body.checksum}"`);
+    assert.deepEqual(result.body.documents, [
+      { id: 'a', title: 'Alpha v2', body: 'now links [[c]]', tags: [] },
+      { id: 'c', title: 'Gamma', body: 'fresh [[a]]', tags: ['new'] },
+    ]);
+
+    // Search and bidirectional links reflect the whole batch immediately.
+    assert.deepEqual((await request(server.url, 'GET', '/search?q=markdown')).body, []);
+    const links = await request(server.url, 'GET', '/documents/a/links');
+    assert.deepEqual(links.body, { outgoing: ['c'], incoming: ['c'] });
+    assert.equal((await request(server.url, 'GET', '/documents/b')).status, 404);
+
+    // The file holds exactly the committed snapshot.
+    const onDisk = new Workspace();
+    onDisk.importJSON(fs.readFileSync(file, 'utf8'), { mode: 'replace' });
+    assert.deepEqual(onDisk.exportJSON(), result.body);
+  } finally {
+    await server.stop();
+  }
+});
+
+test('batch: envelope and operation structure errors are 400 INVALID_BATCH', async () => {
+  const cwd = tempDir();
+  const server = await startServer([path.join(cwd, 'snap.json'), '--port', '0']);
+  try {
+    const { etag } = await request(server.url, 'GET', '/documents');
+    const send = (body) => request(server.url, 'POST', '/batch', { body, headers: { 'if-match': etag } });
+    const create = { type: 'create', document: { id: 'a', title: 'A', body: 'body', tags: [] } };
+
+    for (const body of [
+      null,
+      [],
+      'text',
+      {},
+      { operations: create, dryRun: false },
+      { operations: [], },
+      { operations: [create], extra: true },
+      { operations: [create], dryRun: 'yes' },
+      { operations: [{}] },
+      { operations: [[]] },
+      { operations: [{ type: 'frobnicate', id: 'a' }] },
+      { operations: [{ type: 'create' }] },
+      { operations: [{ ...create, revision: 1 }] },
+      { operations: [{ type: 'delete' }] },
+      { operations: [{ type: 'delete', id: 'a', document: create.document }] },
+      { operations: [{ type: 'delete', id: 7 }] },
+      { operations: [{ type: 'restore', id: 'a' }] },
+      { operations: [create, { type: 'replace', document: { id: 'a', title: 'A2', body: 'x', tags: [] } }] },
+      { operations: [create, { type: 'delete', id: 'a' }] },
+      { operations: Array.from({ length: 101 }, (_, i) => (
+        { type: 'create', document: { id: `d${i}`, title: `T${i}`, body: 'x', tags: [] } }
+      )) },
+    ]) {
+      const response = await send(body);
+      assert.equal(response.status, 400, JSON.stringify(body));
+      assert.equal(response.body.code, 'INVALID_BATCH', JSON.stringify(body));
+    }
+
+    // Exactly 100 operations is accepted.
+    const full = await send({
+      operations: Array.from({ length: 100 }, (_, i) => (
+        { type: 'create', document: { id: `d${i}`, title: `T${i}`, body: 'x', tags: [] } }
+      )),
+    });
+    assert.equal(full.status, 200);
+    assert.equal(full.body.documents.length, 100);
+
+    // Nothing from the failed batches leaked into the state.
+    const listed = await request(server.url, 'GET', '/documents');
+    assert.equal(listed.body.length, 100);
+  } finally {
+    await server.stop();
+  }
+});
+
+test('batch: document and revision errors follow the single-document rules', async () => {
+  const cwd = tempDir();
+  writeSnapshot(path.join(cwd, 'snap.json'), workspaceWith([
+    { id: 'a', title: 'Alpha', body: 'a body', tags: [] },
+  ]));
+  const server = await startHistory(cwd);
+  try {
+    const { etag } = await request(server.url, 'GET', '/documents');
+    const send = (operations) => request(server.url, 'POST', '/batch', {
+      body: { operations }, headers: { 'if-match': etag },
+    });
+
+    const badDocument = await send([{ type: 'create', document: { id: 'Bad Id', title: 'X', body: 'x', tags: [] } }]);
+    assert.equal(badDocument.status, 400);
+    assert.equal(badDocument.body.code, 'INVALID_DOCUMENT');
+
+    const badTags = await send([{ type: 'replace', document: { id: 'a', title: 'A', body: 'x', tags: [1] } }]);
+    assert.equal(badTags.status, 400);
+    assert.equal(badTags.body.code, 'INVALID_DOCUMENT');
+
+    const badRevision = await send([{ type: 'restore', id: 'a', revision: 1.5 }]);
+    assert.equal(badRevision.status, 400);
+    assert.equal(badRevision.body.code, 'INVALID_REVISION');
+
+    const unknownRevision = await send([{ type: 'restore', id: 'a', revision: 99 }]);
+    assert.equal(unknownRevision.status, 404);
+    assert.equal(unknownRevision.body.code, 'NOT_FOUND');
+
+    const neverExisted = await send([{ type: 'restore', id: 'ghost', revision: 1 }]);
+    assert.equal(neverExisted.status, 404);
+    assert.equal(neverExisted.body.code, 'NOT_FOUND');
+
+    const invalidJson = await request(server.url, 'POST', '/batch', {
+      rawBody: '{not json', headers: { 'if-match': etag },
+    });
+    assert.equal(invalidJson.status, 400);
+    assert.equal(invalidJson.body.code, 'INVALID_JSON');
+
+    const oversized = await request(server.url, 'POST', '/batch', {
+      rawBody: JSON.stringify({ operations: [{ type: 'create', document: { id: 'big', title: 'B', body: 'x'.repeat(1024 * 1024), tags: [] } }] }),
+      headers: { 'if-match': etag },
+    });
+    assert.equal(oversized.status, 413);
+    assert.equal(oversized.body.code, 'PAYLOAD_TOO_LARGE');
+
+    // State is untouched by every failure.
+    const listed = await request(server.url, 'GET', '/documents');
+    assert.deepEqual(listed.body.map((document) => document.id), ['a']);
+    assert.equal(listed.etag, etag);
+  } finally {
+    await server.stop();
+  }
+});
+
+test('batch: one failing operation rejects the whole batch', async () => {
+  const cwd = tempDir();
+  const file = path.join(cwd, 'snap.json');
+  writeSnapshot(file, workspaceWith([
+    { id: 'a', title: 'Alpha', body: 'a body', tags: [] },
+  ]));
+  const before = fs.readFileSync(file, 'utf8');
+  const server = await startServer([file, '--port', '0']);
+  try {
+    const { etag } = await request(server.url, 'GET', '/documents');
+
+    const createExisting = await request(server.url, 'POST', '/batch', {
+      body: { operations: [
+        { type: 'create', document: { id: 'b', title: 'Beta', body: 'b body', tags: [] } },
+        { type: 'create', document: { id: 'a', title: 'Other', body: 'x', tags: [] } },
+      ] },
+      headers: { 'if-match': etag },
+    });
+    assert.equal(createExisting.status, 409);
+    assert.equal(createExisting.body.code, 'CONFLICT');
+
+    const replaceMissing = await request(server.url, 'POST', '/batch', {
+      body: { operations: [
+        { type: 'delete', id: 'a' },
+        { type: 'replace', document: { id: 'ghost', title: 'G', body: 'x', tags: [] } },
+      ] },
+      headers: { 'if-match': etag },
+    });
+    assert.equal(replaceMissing.status, 404);
+    assert.equal(replaceMissing.body.code, 'NOT_FOUND');
+
+    const deleteMissing = await request(server.url, 'POST', '/batch', {
+      body: { operations: [{ type: 'delete', id: 'ghost' }] },
+      headers: { 'if-match': etag },
+    });
+    assert.equal(deleteMissing.status, 404);
+
+    // A final-set title collision rejects everything, including valid ops.
+    const titleClash = await request(server.url, 'POST', '/batch', {
+      body: { operations: [
+        { type: 'create', document: { id: 'b', title: 'Beta', body: 'b body', tags: [] } },
+        { type: 'replace', document: { id: 'a', title: ' Beta ', body: 'a body', tags: [] } },
+      ] },
+      headers: { 'if-match': etag },
+    });
+    assert.equal(titleClash.status, 409);
+    assert.equal(titleClash.body.code, 'CONFLICT');
+
+    const listed = await request(server.url, 'GET', '/documents');
+    assert.deepEqual(listed.body.map((document) => document.id), ['a']);
+    assert.equal(listed.etag, etag);
+    assert.equal(fs.readFileSync(file, 'utf8'), before);
+  } finally {
+    await server.stop();
+  }
+});
+
+test('batch: titles are only judged on the final set', async () => {
+  const cwd = tempDir();
+  writeSnapshot(path.join(cwd, 'snap.json'), workspaceWith([
+    { id: 'a', title: 'Alpha', body: 'a body', tags: [] },
+    { id: 'b', title: 'Beta', body: 'b body', tags: [] },
+  ]));
+  const server = await startServer([path.join(cwd, 'snap.json'), '--port', '0']);
+  try {
+    let et = (await request(server.url, 'GET', '/documents')).etag;
+
+    // Swapping two titles in one batch is fine regardless of operation order.
+    const swapped = await request(server.url, 'POST', '/batch', {
+      body: { operations: [
+        { type: 'replace', document: { id: 'a', title: 'Beta', body: 'a body', tags: [] } },
+        { type: 'replace', document: { id: 'b', title: 'Alpha', body: 'b body', tags: [] } },
+      ] },
+      headers: { 'if-match': et },
+    });
+    assert.equal(swapped.status, 200);
+    et = swapped.etag;
+
+    // A title freed by a delete in the same batch can be reused.
+    const reused = await request(server.url, 'POST', '/batch', {
+      body: { operations: [
+        { type: 'delete', id: 'a' },
+        { type: 'create', document: { id: 'c', title: 'Beta', body: 'c body', tags: [] } },
+      ] },
+      headers: { 'if-match': et },
+    });
+    assert.equal(reused.status, 200);
+    assert.deepEqual(reused.body.documents.map((document) => document.id), ['b', 'c']);
+
+    // Titles stay trimmed and case-sensitive: ' Alpha ' collides after
+    // trimming, 'alpha' does not.
+    const caseSensitive = await request(server.url, 'POST', '/batch', {
+      body: { operations: [
+        { type: 'create', document: { id: 'd', title: ' Alpha ', body: 'd body', tags: [] } },
+      ] },
+      headers: { 'if-match': reused.etag },
+    });
+    assert.equal(caseSensitive.status, 409);
+    const lower = await request(server.url, 'POST', '/batch', {
+      body: { operations: [
+        { type: 'create', document: { id: 'd', title: 'alpha', body: 'd body', tags: [] } },
+      ] },
+      headers: { 'if-match': reused.etag },
+    });
+    assert.equal(lower.status, 200);
+  } finally {
+    await server.stop();
+  }
+});
+
+test('batch: dryRun previews the projected snapshot without changing anything', async () => {
+  const cwd = tempDir();
+  const file = path.join(cwd, 'snap.json');
+  const server = await startServer([file, '--port', '0']);
+  try {
+    const empty = await request(server.url, 'GET', '/documents');
+    const preview = await request(server.url, 'POST', '/batch', {
+      body: { dryRun: true, operations: [
+        { type: 'create', document: { id: 'a', title: 'A', body: 'a body', tags: [] } },
+      ] },
+      headers: { 'if-match': empty.etag },
+    });
+    assert.equal(preview.status, 200);
+    assert.equal(preview.body.documents.length, 1);
+    assert.equal(preview.etag, `"${preview.body.checksum}"`);
+
+    // The current checksum, queries, and files are unchanged.
+    const stillEmpty = await request(server.url, 'GET', '/documents');
+    assert.deepEqual(stillEmpty.body, []);
+    assert.equal(stillEmpty.etag, empty.etag);
+    assert.ok(!fs.existsSync(file));
+
+    // A dry run still validates and still requires If-Match.
+    const noMatch = await request(server.url, 'POST', '/batch', {
+      body: { dryRun: true, operations: [{ type: 'delete', id: 'a' }] },
+    });
+    assert.equal(noMatch.status, 428);
+    const stale = await request(server.url, 'POST', '/batch', {
+      body: { dryRun: true, operations: [{ type: 'delete', id: 'a' }] },
+      headers: { 'if-match': `"${'0'.repeat(64)}"` },
+    });
+    assert.equal(stale.status, 412);
+    const invalid = await request(server.url, 'POST', '/batch', {
+      body: { dryRun: true, operations: [] },
+      headers: { 'if-match': empty.etag },
+    });
+    assert.equal(invalid.status, 400);
+
+    // Another writer may commit in the meantime; the real commit must match
+    // the then-current checksum.
+    const created = await request(server.url, 'POST', '/documents', {
+      body: { id: 'x', title: 'X', body: 'x body', tags: [] },
+      headers: { 'if-match': empty.etag },
+    });
+    assert.equal(created.status, 201);
+    const commit = await request(server.url, 'POST', '/batch', {
+      body: { operations: [{ type: 'create', document: { id: 'a', title: 'A', body: 'a body', tags: [] } }] },
+      headers: { 'if-match': empty.etag },
+    });
+    assert.equal(commit.status, 412);
+    const committed = await request(server.url, 'POST', '/batch', {
+      body: { operations: [{ type: 'create', document: { id: 'a', title: 'A', body: 'a body', tags: [] } }] },
+      headers: { 'if-match': created.etag },
+    });
+    assert.equal(committed.status, 200);
+    assert.deepEqual(committed.body.documents.map((document) => document.id), ['a', 'x']);
+  } finally {
+    await server.stop();
+  }
+});
+
+test('batch: a batch and a single write on the same checksum succeed at most once', async () => {
+  const cwd = tempDir();
+  const server = await startServer([path.join(cwd, 'snap.json'), '--port', '0']);
+  try {
+    const empty = await request(server.url, 'GET', '/documents');
+    const [single, batch] = await Promise.all([
+      request(server.url, 'POST', '/documents', {
+        body: { id: 'a', title: 'A', body: 'a body', tags: [] },
+        headers: { 'if-match': empty.etag },
+      }),
+      request(server.url, 'POST', '/batch', {
+        body: { operations: [{ type: 'create', document: { id: 'b', title: 'B', body: 'b body', tags: [] } }] },
+        headers: { 'if-match': empty.etag },
+      }),
+    ]);
+    const statuses = [single.status, batch.status];
+    assert.ok(statuses.includes(412));
+    assert.ok(statuses.includes(200) || statuses.includes(201));
+    const listed = await request(server.url, 'GET', '/documents');
+    assert.equal(listed.body.length, 1);
+  } finally {
+    await server.stop();
+  }
+});
+
+test('batch: a failed save returns 500 IO_ERROR and leaves everything intact', async () => {
+  const cwd = tempDir();
+  const blocked = path.join(cwd, 'no-such-dir', 'snap.json');
+  const server = await startServer([blocked, '--port', '0']);
+  try {
+    const empty = await request(server.url, 'GET', '/documents');
+    const failed = await request(server.url, 'POST', '/batch', {
+      body: { operations: [
+        { type: 'create', document: { id: 'a', title: 'A', body: 'a body', tags: [] } },
+        { type: 'create', document: { id: 'b', title: 'B', body: 'b body', tags: [] } },
+      ] },
+      headers: { 'if-match': empty.etag },
+    });
+    assert.equal(failed.status, 500);
+    assert.equal(failed.body.code, 'IO_ERROR');
+    assert.ok(!fs.existsSync(blocked));
+
+    const listed = await request(server.url, 'GET', '/documents');
+    assert.deepEqual(listed.body, []);
+    assert.equal(listed.etag, empty.etag);
+  } finally {
+    await server.stop();
+  }
+});
+
+test('batch with history: one record per changed document, no-ops append nothing', async () => {
+  const cwd = tempDir();
+  const { snapshot, history } = historyPaths(cwd);
+  writeSnapshot(snapshot, workspaceWith([
+    { id: 'a', title: 'Alpha', body: 'a body', tags: ['One'] },
+    { id: 'b', title: 'Beta', body: 'b body', tags: [] },
+  ]));
+  const server = await startHistory(cwd);
+  try {
+    let et = (await request(server.url, 'GET', '/documents')).etag;
+
+    // A batch that changes nothing keeps the ETag and writes no files.
+    const noop = await request(server.url, 'POST', '/batch', {
+      body: { operations: [
+        { type: 'replace', document: { id: 'a', title: ' Alpha ', body: 'a body', tags: [' one ', 'ONE'] } },
+        { type: 'restore', id: 'b', revision: 1 },
+      ] },
+      headers: { 'if-match': et },
+    });
+    assert.equal(noop.status, 200);
+    assert.equal(noop.etag, et);
+    assert.ok(!fs.existsSync(history));
+    assert.equal((await request(server.url, 'GET', '/documents/a/history')).body.length, 1);
+
+    // A mixed batch appends exactly one record per changed document.
+    const mixed = await request(server.url, 'POST', '/batch', {
+      body: { operations: [
+        { type: 'replace', document: { id: 'a', title: 'Alpha', body: 'a body v2', tags: [] } },
+        { type: 'delete', id: 'b' },
+        { type: 'create', document: { id: 'c', title: 'Gamma', body: 'c body', tags: [] } },
+      ] },
+      headers: { 'if-match': et },
+    });
+    assert.equal(mixed.status, 200);
+    et = mixed.etag;
+    assert.deepEqual(
+      (await request(server.url, 'GET', '/documents/a/history')).body.map((entry) => [entry.revision, entry.action]),
+      [[1, 'baseline'], [2, 'replace']],
+    );
+    assert.deepEqual(
+      (await request(server.url, 'GET', '/documents/b/history')).body.map((entry) => [entry.revision, entry.action]),
+      [[1, 'baseline'], [2, 'delete']],
+    );
+    assert.deepEqual(
+      (await request(server.url, 'GET', '/documents/c/history')).body.map((entry) => [entry.revision, entry.action]),
+      [[1, 'create']],
+    );
+
+    // Restore inside a batch revives a deleted document and keeps counting.
+    const revived = await request(server.url, 'POST', '/batch', {
+      body: { operations: [{ type: 'restore', id: 'b', revision: 1 }] },
+      headers: { 'if-match': et },
+    });
+    assert.equal(revived.status, 200);
+    et = revived.etag;
+    const bRows = (await request(server.url, 'GET', '/documents/b/history')).body;
+    assert.deepEqual(bRows.map((entry) => [entry.revision, entry.action]), [[1, 'baseline'], [2, 'delete'], [3, 'restore']]);
+    assert.equal((await request(server.url, 'GET', '/documents/b')).body.body, 'b body');
+
+    // Recreating a deleted id inside a batch continues the revision chain.
+    await request(server.url, 'DELETE', '/documents/c', { headers: { 'if-match': et } });
+    et = (await request(server.url, 'GET', '/documents')).etag;
+    const recreated = await request(server.url, 'POST', '/batch', {
+      body: { operations: [{ type: 'create', document: { id: 'c', title: 'Gamma reborn', body: 'new', tags: [] } }] },
+      headers: { 'if-match': et },
+    });
+    assert.equal(recreated.status, 200);
+    assert.deepEqual(
+      (await request(server.url, 'GET', '/documents/c/history')).body.map((entry) => [entry.revision, entry.action]),
+      [[1, 'create'], [2, 'delete'], [3, 'create']],
+    );
+
+    // A failed batch consumes no revisions.
+    const failed = await request(server.url, 'POST', '/batch', {
+      body: { operations: [
+        { type: 'replace', document: { id: 'a', title: 'Alpha', body: 'changed again', tags: [] } },
+        { type: 'delete', id: 'ghost' },
+      ] },
+      headers: { 'if-match': recreated.etag },
+    });
+    assert.equal(failed.status, 404);
+    assert.equal((await request(server.url, 'GET', '/documents/a/history')).body.length, 2);
+  } finally {
+    await server.stop();
+  }
+});
+
+test('batch: restore operations require history and follow single-restore rules', async () => {
+  const cwd = tempDir();
+  writeSnapshot(path.join(cwd, 'snap.json'), workspaceWith([
+    { id: 'a', title: 'Alpha', body: 'a body', tags: [] },
+  ]));
+  const server = await startServer([path.join(cwd, 'snap.json'), '--port', '0']);
+  try {
+    const { etag } = await request(server.url, 'GET', '/documents');
+    const response = await request(server.url, 'POST', '/batch', {
+      body: { operations: [
+        { type: 'create', document: { id: 'b', title: 'B', body: 'b body', tags: [] } },
+        { type: 'restore', id: 'a', revision: 1 },
+      ] },
+      headers: { 'if-match': etag },
+    });
+    assert.equal(response.status, 404);
+    assert.equal(response.body.code, 'NOT_FOUND');
+    const listed = await request(server.url, 'GET', '/documents');
+    assert.deepEqual(listed.body.map((document) => document.id), ['a']);
+    assert.equal(listed.etag, etag);
+  } finally {
+    await server.stop();
+  }
+});
+
+test('batch: restore of a delete revision is 400 INVALID_REVISION', async () => {
+  const cwd = tempDir();
+  const server = await startHistory(cwd);
+  try {
+    let et = (await request(server.url, 'GET', '/documents')).etag;
+    const send = async (method, route, body) => {
+      const response = await request(server.url, method, route, { body, headers: { 'if-match': et } });
+      if (response.status < 400) et = response.etag;
+      return response;
+    };
+    await send('POST', '/documents', { id: 'a', title: 'A', body: 'v1', tags: [] });
+    await send('DELETE', '/documents/a');
+
+    const restoreDelete = await send('POST', '/batch', { operations: [{ type: 'restore', id: 'a', revision: 2 }] });
+    assert.equal(restoreDelete.status, 400);
+    assert.equal(restoreDelete.body.code, 'INVALID_REVISION');
+
+    // Existence and revisions are judged against the pre-batch state: a
+    // restore of a deleted id and a create of another id commit together.
+    const committed = await send('POST', '/batch', { operations: [
+      { type: 'restore', id: 'a', revision: 1 },
+      { type: 'create', document: { id: 'b', title: 'B', body: 'b body', tags: [] } },
+    ] });
+    assert.equal(committed.status, 200);
+    assert.deepEqual(committed.body.documents.map((document) => document.id), ['a', 'b']);
+    assert.deepEqual(
+      (await request(server.url, 'GET', '/documents/a/history')).body.map((entry) => entry.action),
+      ['create', 'delete', 'restore'],
+    );
+  } finally {
+    await server.stop();
+  }
+});

@@ -132,6 +132,44 @@ exactly one JSON line with the actual address, e.g.
   JSON/document fields `400`, and bodies over 1 MiB `413`. Every failure
   response carries a stable `code` and never changes the stored content.
 
+#### Batch writes (`POST /batch`)
+
+`POST /batch` commits several document changes as one all-or-nothing write.
+The body is `{ "operations": [...], "dryRun": false }` with no other fields;
+`operations` holds 1–100 items, each discriminated by `type`:
+
+- `create` / `replace`: plus a `document` (validated and normalized exactly
+  like the single-document routes).
+- `delete`: plus an `id`.
+- `restore`: plus an `id` and a `revision` (follows the single-restore rules;
+  a batch containing `restore` is `404`/`NOT_FOUND` when history is disabled).
+
+Structural problems — an unknown action, missing/extra batch or operation
+fields, a duplicate target id, or a malformed envelope — are
+`400`/`INVALID_BATCH`; document and revision content errors keep the
+single-document codes (`INVALID_DOCUMENT`, `INVALID_REVISION`). Existence and
+restore revisions are judged against the same pre-commit state for every
+operation: creating an existing id is `409`/`CONFLICT`, replacing or deleting
+a missing document is `404`/`NOT_FOUND`, and any failure rejects the whole
+batch. Title uniqueness is only checked on the final set (trimmed,
+case-sensitive), so swapping titles or reusing a freed title within one batch
+is fine; a still-duplicated title is `409`/`CONFLICT`.
+
+Preview and commit both require `If-Match` and answer `200` with the result
+snapshot and its `ETag`. With `"dryRun": true` the projected snapshot is
+returned but the checksum, queries, history, and files are untouched, and a
+later real commit must match the then-current checksum. A batch and a
+single-document write built on the same checksum conflict exactly like two
+single writes: at most one commits, the rest get `412`.
+
+With history enabled, each actually changed document appends exactly one
+record with its action, revisions continuing per document (including
+recreated ids); normalized-identical replaces or restores append nothing, and
+a batch that changes nothing keeps the current `ETag` and writes no files. A
+failed save answers `500`/`IO_ERROR` with content, queries, history, and
+files unchanged, and a crash mid-commit is recovered to the whole pre- or
+post-batch state on restart, like any other commit.
+
 #### Persistent history (`--history <file>`)
 
 Passing `--history <file>` enables a durable, per-document revision ledger in

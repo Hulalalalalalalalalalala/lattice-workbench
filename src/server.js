@@ -3,9 +3,16 @@ import { SnapshotError, Workspace } from './workspace.js';
 import { sameDocument } from './history.js';
 
 const MAX_BODY_BYTES = 1024 * 1024;
+const MAX_BATCH_OPERATIONS = 100;
 const ETAG_PATTERN = /^"[0-9a-f]{64}"$/u;
 const ID_PATTERN = /^[a-z0-9][a-z0-9._-]*$/u;
 const DOCUMENT_FIELDS = new Set(['id', 'title', 'body', 'tags']);
+const OPERATION_FIELDS = {
+  create: ['document'],
+  replace: ['document'],
+  delete: ['id'],
+  restore: ['id', 'revision'],
+};
 
 class HttpError extends Error {
   constructor(status, code, message) {
@@ -72,6 +79,78 @@ function validateDocument(data) {
   return { id: data.id, title: data.title, body: data.body, tags: data.tags ?? [] };
 }
 
+// Validates one batch operation's shape. Structural problems (unknown action,
+// missing/extra fields, wrong field types) report INVALID_BATCH; the document
+// payload itself is validated exactly like a single-document write, and a
+// malformed restore revision follows the single-restore rule.
+function parseOperation(raw, index) {
+  const location = `operations[${index}]`;
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new HttpError(400, 'INVALID_BATCH', `${location} must be an object`);
+  }
+  const fields = OPERATION_FIELDS[raw.type];
+  if (!fields) {
+    throw new HttpError(400, 'INVALID_BATCH', `${location} has an unknown action`);
+  }
+  const expected = new Set(['type', ...fields]);
+  for (const key of Object.keys(raw)) {
+    if (!expected.has(key)) {
+      throw new HttpError(400, 'INVALID_BATCH', `${location} has unknown field: ${key}`);
+    }
+  }
+  for (const key of expected) {
+    if (!Object.hasOwn(raw, key)) {
+      throw new HttpError(400, 'INVALID_BATCH', `${location} is missing field: ${key}`);
+    }
+  }
+  if (raw.type === 'create' || raw.type === 'replace') {
+    return { type: raw.type, document: validateDocument(raw.document) };
+  }
+  if (typeof raw.id !== 'string') {
+    throw new HttpError(400, 'INVALID_BATCH', `${location}.id must be a string`);
+  }
+  if (raw.type === 'delete') {
+    return { type: 'delete', id: raw.id };
+  }
+  if (!Number.isInteger(raw.revision) || raw.revision < 1) {
+    throw new HttpError(400, 'INVALID_REVISION', 'revision must be a positive integer');
+  }
+  return { type: 'restore', id: raw.id, revision: raw.revision };
+}
+
+// Validates the batch envelope: exactly `operations` plus an optional boolean
+// `dryRun`, 1-100 operations, and no id targeted by more than one operation.
+function parseBatch(data) {
+  if (!data || typeof data !== 'object' || Array.isArray(data)) {
+    throw new HttpError(400, 'INVALID_BATCH', 'batch must be an object');
+  }
+  for (const key of Object.keys(data)) {
+    if (key !== 'operations' && key !== 'dryRun') {
+      throw new HttpError(400, 'INVALID_BATCH', `unknown batch field: ${key}`);
+    }
+  }
+  if (data.dryRun !== undefined && typeof data.dryRun !== 'boolean') {
+    throw new HttpError(400, 'INVALID_BATCH', 'dryRun must be a boolean');
+  }
+  if (!Array.isArray(data.operations)
+    || data.operations.length === 0
+    || data.operations.length > MAX_BATCH_OPERATIONS) {
+    throw new HttpError(400, 'INVALID_BATCH', `operations must be an array of 1 to ${MAX_BATCH_OPERATIONS} items`);
+  }
+  const operations = data.operations.map((raw, index) => parseOperation(raw, index));
+  const targets = new Set();
+  for (const operation of operations) {
+    const target = operation.type === 'create' || operation.type === 'replace'
+      ? operation.document.id
+      : operation.id;
+    if (targets.has(target)) {
+      throw new HttpError(400, 'INVALID_BATCH', `duplicate target id: ${target}`);
+    }
+    targets.add(target);
+  }
+  return { operations, dryRun: data.dryRun ?? false };
+}
+
 // A document server holds one Workspace and, when a history store is supplied,
 // a per-document revision ledger. Every committed change is persisted through
 // `save(snapshot, historySnapshot)` before the in-memory state is swapped, so a
@@ -109,8 +188,9 @@ export function createDocumentServer({ workspace, save, history = null }) {
   // Builds the next state on a candidate workspace and lets `mutate` append to
   // the next ledger. The callback returns false to signal a content-preserving
   // write (normalized content unchanged): the request still succeeds, but no
-  // revision is appended and nothing is persisted.
-  function commit(mutate) {
+  // revision is appended and nothing is persisted. With `dryRun` the projected
+  // snapshot is returned without saving or swapping the live state.
+  function commit(mutate, dryRun = false) {
     const candidate = new Workspace();
     for (const document of current.list()) candidate.add(document);
     const nextLedger = ledger ? ledger.clone() : null;
@@ -119,9 +199,11 @@ export function createDocumentServer({ workspace, save, history = null }) {
       return current.exportJSON();
     }
     const snapshot = candidate.exportJSON();
-    save(snapshot, nextLedger ? nextLedger.exportJSON(snapshot.checksum) : null);
-    current = candidate;
-    ledger = nextLedger;
+    if (!dryRun) {
+      save(snapshot, nextLedger ? nextLedger.exportJSON(snapshot.checksum) : null);
+      current = candidate;
+      ledger = nextLedger;
+    }
     return snapshot;
   }
 
@@ -220,6 +302,89 @@ export function createDocumentServer({ workspace, save, history = null }) {
     sendJson(res, 200, snapshot, `"${snapshot.checksum}"`);
   }
 
+  // Resolves every operation against the same pre-commit state: existence,
+  // revision chains, and restore targets never see the effects of the other
+  // operations in the batch.
+  function prepareBatch(operations) {
+    if (!ledger && operations.some((operation) => operation.type === 'restore')) {
+      throw new HttpError(404, 'NOT_FOUND', 'restore requires history to be enabled');
+    }
+    return operations.map((operation) => {
+      if (operation.type === 'create') {
+        if (current.get(operation.document.id)) {
+          throw new HttpError(409, 'CONFLICT', `document already exists: ${operation.document.id}`);
+        }
+        return operation;
+      }
+      if (operation.type === 'replace' || operation.type === 'delete') {
+        const id = operation.type === 'replace' ? operation.document.id : operation.id;
+        const before = current.get(id);
+        if (!before) throw new HttpError(404, 'NOT_FOUND', `document not found: ${id}`);
+        return { ...operation, before };
+      }
+      const chain = ledger.entries(operation.id);
+      if (!chain) throw new HttpError(404, 'NOT_FOUND', `document never existed: ${operation.id}`);
+      const target = ledger.entry(operation.id, operation.revision);
+      if (!target) {
+        throw new HttpError(404, 'NOT_FOUND', `unknown revision ${operation.revision} for document ${operation.id}`);
+      }
+      if (target.action === 'delete') {
+        throw new HttpError(400, 'INVALID_REVISION', `revision ${operation.revision} of document ${operation.id} is a delete and cannot be restored`);
+      }
+      return { ...operation, before: current.get(operation.id), target: target.document };
+    });
+  }
+
+  async function batchDocuments(req, res) {
+    const text = await readBody(req);
+    requireIfMatch(req);
+    const { operations, dryRun } = parseBatch(parseJson(text));
+    const prepared = prepareBatch(operations);
+    const snapshot = commit((candidate, nextLedger) => {
+      let changed = false;
+      for (const operation of prepared) {
+        if (operation.type === 'create') {
+          candidate.add(operation.document);
+          if (nextLedger) nextLedger.record(operation.document.id, 'create', candidate.get(operation.document.id));
+          changed = true;
+        } else if (operation.type === 'replace') {
+          candidate.remove(operation.document.id);
+          candidate.add(operation.document);
+          const stored = candidate.get(operation.document.id);
+          // A replace whose normalized content is identical appends no record.
+          if (!sameDocument(operation.before, stored)) {
+            if (nextLedger) nextLedger.record(operation.document.id, 'replace', stored);
+            changed = true;
+          }
+        } else if (operation.type === 'delete') {
+          candidate.remove(operation.id);
+          if (nextLedger) nextLedger.record(operation.id, 'delete', null);
+          changed = true;
+        } else {
+          candidate.remove(operation.id);
+          candidate.add(operation.target);
+          const stored = candidate.get(operation.id);
+          // Restoring the already-current content appends no record.
+          if (!operation.before || !sameDocument(operation.before, stored)) {
+            if (nextLedger) nextLedger.record(operation.id, 'restore', stored);
+            changed = true;
+          }
+        }
+      }
+      // Titles are only judged on the final set, so swapping titles or reusing
+      // a freed title does not depend on the order of operations.
+      const titles = new Set();
+      for (const document of candidate.list()) {
+        if (titles.has(document.title)) {
+          throw new HttpError(409, 'CONFLICT', `title already in use: ${document.title}`);
+        }
+        titles.add(document.title);
+      }
+      return changed;
+    }, dryRun);
+    sendJson(res, 200, snapshot, `"${snapshot.checksum}"`);
+  }
+
   async function handle(req, res) {
     const url = new URL(req.url, 'http://127.0.0.1');
     const segments = url.pathname.split('/').filter(Boolean).map(decodeURIComponent);
@@ -259,6 +424,9 @@ export function createDocumentServer({ workspace, save, history = null }) {
       return;
     } else if (resource === 'documents' && segments.length === 3 && relation === 'restore' && req.method === 'POST') {
       await restoreDocument(req, res, id);
+      return;
+    } else if (resource === 'batch' && segments.length === 1 && req.method === 'POST') {
+      await batchDocuments(req, res);
       return;
     } else if (resource === 'search' && segments.length === 1 && req.method === 'GET') {
       sendJson(res, 200, current.search(url.searchParams.get('q') ?? ''), currentEtag());
