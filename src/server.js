@@ -1,6 +1,7 @@
 import http from 'node:http';
 import { SnapshotError, Workspace, normalizeTags } from './workspace.js';
 import { sameDocument } from './history.js';
+import { reconcileSnapshots } from './reconcile.js';
 
 const MAX_BODY_BYTES = 1024 * 1024;
 const ETAG_PATTERN = /^"[0-9a-f]{64}"$/u;
@@ -25,11 +26,12 @@ function sameTags(a, b) {
 }
 
 class HttpError extends Error {
-  constructor(status, code, message) {
+  constructor(status, code, message, extra = {}) {
     super(message);
     this.name = 'HttpError';
     this.status = status;
     this.code = code;
+    for (const [key, value] of Object.entries(extra)) this[key] = value;
   }
 }
 
@@ -241,6 +243,33 @@ function validateTagRules(data) {
   }
 
   return { rules, dryRun };
+}
+
+// Validates the reconcile envelope `{ base, incoming, dryRun? }`, where base
+// and incoming are version-1 snapshot objects (strings are not accepted at
+// this layer; malformed JSON is rejected earlier by the shared body parser).
+// Snapshot contents themselves are validated by normalizeSnapshot via the
+// reconcile core, which reports INVALID_SNAPSHOT.
+function validateReconcileRequest(data) {
+  if (!data || typeof data !== 'object' || Array.isArray(data)) {
+    throw new HttpError(400, 'INVALID_OPTIONS', 'reconcile body must be an object');
+  }
+  for (const key of Object.keys(data)) {
+    if (key !== 'base' && key !== 'incoming' && key !== 'dryRun') {
+      throw new HttpError(400, 'INVALID_OPTIONS', `unknown reconcile field: ${key}`);
+    }
+  }
+  if (!data.base || typeof data.base !== 'object' || Array.isArray(data.base)) {
+    throw new HttpError(400, 'INVALID_OPTIONS', 'base must be a snapshot object');
+  }
+  if (!data.incoming || typeof data.incoming !== 'object' || Array.isArray(data.incoming)) {
+    throw new HttpError(400, 'INVALID_OPTIONS', 'incoming must be a snapshot object');
+  }
+  const dryRun = data.dryRun === undefined ? false : data.dryRun;
+  if (typeof dryRun !== 'boolean') {
+    throw new HttpError(400, 'INVALID_OPTIONS', 'dryRun must be a boolean');
+  }
+  return { base: data.base, incoming: data.incoming, dryRun };
 }
 
 // A document server holds one Workspace and, when a history store is supplied,
@@ -571,6 +600,71 @@ export function createDocumentServer({ workspace, save, history = null }) {
     sendJson(res, 200, { snapshot, changedIds }, `"${snapshot.checksum}"`);
   }
 
+  // Merges an offline-edited incoming snapshot back against its base, keeping
+  // non-conflicting online edits. The merge is computed against the current
+  // live state; field/add/delete/title conflicts reject the whole request.
+  // Each actually-changed document appends one ledger record (create for new
+  // or reappearing ids, replace for edits, delete for removals), continuing
+  // that id's revision sequence. Returns `{ snapshot, changedIds }` without
+  // persisting when `dryRun` is true or the merge leaves the content equal to
+  // the current state.
+  function commitReconcile(base, incoming, dryRun) {
+    const currentSnapshot = current.exportJSON();
+    const result = reconcileSnapshots(currentSnapshot, base, incoming);
+    if (result.conflicts.length > 0) {
+      throw new HttpError(409, 'RECONCILE_CONFLICT', 'reconcile conflicts detected', {
+        conflicts: result.conflicts,
+      });
+    }
+    if (result.snapshot.checksum === currentSnapshot.checksum) {
+      return { snapshot: currentSnapshot, changedIds: [] };
+    }
+
+    const candidate = new Workspace();
+    for (const document of result.snapshot.documents) candidate.add(document);
+    const nextLedger = ledger ? ledger.clone() : null;
+    for (const id of result.changedIds) {
+      if (!nextLedger) break;
+      const stored = candidate.get(id);
+      if (stored) {
+        // A previously-deleted id that reappears continues its chain with a
+        // create; a changed live document gets a replace.
+        const action = current.get(id) ? 'replace' : 'create';
+        nextLedger.record(id, action, stored);
+      } else {
+        nextLedger.record(id, 'delete', null);
+      }
+    }
+
+    if (dryRun) {
+      return { snapshot: candidate.exportJSON(), changedIds: result.changedIds };
+    }
+
+    const snapshot = candidate.exportJSON();
+    save(snapshot, nextLedger ? nextLedger.exportJSON(snapshot.checksum) : null);
+    current = candidate;
+    ledger = nextLedger;
+    return { snapshot, changedIds: result.changedIds };
+  }
+
+  async function reconcile(req, res) {
+    const text = await readBody(req);
+    requireIfMatch(req);
+    const { base, incoming, dryRun } = validateReconcileRequest(parseJson(text));
+    try {
+      const snapshot = commitReconcile(base, incoming, dryRun).snapshot;
+      sendJson(res, 200, snapshot, `"${snapshot.checksum}"`);
+    } catch (error) {
+      // Both snapshots must pass the existing validation; surface those
+      // failures as INVALID_SNAPSHOT rather than an internal error. Save
+      // failures keep their 500/IO_ERROR semantics.
+      if (error instanceof SnapshotError && error.code === 'INVALID_SNAPSHOT') {
+        throw new HttpError(400, 'INVALID_SNAPSHOT', error.message);
+      }
+      throw error;
+    }
+  }
+
   async function handle(req, res) {
     const url = new URL(req.url, 'http://127.0.0.1');
     const segments = url.pathname.split('/').filter(Boolean).map(decodeURIComponent);
@@ -620,6 +714,9 @@ export function createDocumentServer({ workspace, save, history = null }) {
     } else if (resource === 'tags' && segments.length === 2 && id === 'rewrite' && req.method === 'POST') {
       await rewriteTags(req, res);
       return;
+    } else if (resource === 'snapshots' && segments.length === 2 && id === 'reconcile' && req.method === 'POST') {
+      await reconcile(req, res);
+      return;
     } else if (resource === 'search' && segments.length === 1 && req.method === 'GET') {
       sendJson(res, 200, current.search(url.searchParams.get('q') ?? ''), currentEtag());
       return;
@@ -637,7 +734,9 @@ export function createDocumentServer({ workspace, save, history = null }) {
       const code = error instanceof HttpError ? error.code
         : error instanceof SnapshotError ? error.code
           : 'INTERNAL_ERROR';
-      sendJson(res, status, { code, message: error.message });
+      const payload = { code, message: error.message };
+      if (Array.isArray(error.conflicts)) payload.conflicts = error.conflicts;
+      sendJson(res, status, payload);
     });
   });
   return server;

@@ -228,6 +228,54 @@ exactly one JSON line with the actual address, e.g.
     restart after a kill mid-commit lands entirely on the pre- or post-rewrite
     state. The migration formats stay unchanged.
 
+#### Merging offline edits
+
+- `POST /snapshots/reconcile` imports an offline-edited snapshot while keeping
+  non-conflicting online edits made since the export. The body is exactly
+  `{ "base", "incoming", "dryRun"? }`: `base` is the snapshot the offline
+  editing started from, `incoming` the edited result, both plain version-1
+  snapshot objects in the existing format (JSON strings are not accepted
+  here). Both snapshots must pass the existing validation; JSON and Markdown
+  import behavior is unchanged.
+  - For a document present in all three snapshots, `title`, `body`, and
+    `tags` are each compared with the base independently: a field changed on
+    only one side is kept, both sides changing a field to the same normalized
+    value is accepted, and both sides changing the same field to different
+    values conflicts. Changes to different fields are both kept. Bodies are
+    compared as complete strings and preserved verbatim; tags are compared as
+    one normalized group, never merged piece by piece.
+  - An id absent from the base and added on one side is kept; both sides
+    adding the same id is accepted only when the normalized documents are
+    identical, otherwise it conflicts. A deletion on one side against an
+    unchanged or also-deleted other side deletes the document; a deletion
+    meeting a modification conflicts.
+  - The final title set must be unique, while title swaps are permitted. A
+    duplicate final title is a conflict only when no field/add/delete
+    conflicts were found, and every involved document is reported.
+  - A conflict answers `409`/`RECONCILE_CONFLICT`; `conflicts` is a
+    deduplicated list of `{ "id", "fields" }` entries covering every field or
+    add/delete conflict, sorted by id and then field name in Unicode
+    code-point order. Field conflicts use `title`/`body`/`tags`; a divergent
+    same-id addition or a delete-meets-modify case uses `document`; final
+    title duplicates use `title`.
+  - Bad request structure answers `400`/`INVALID_OPTIONS`; a snapshot that
+    fails validation answers `400`/`INVALID_SNAPSHOT`. Malformed JSON, bodies
+    over 1 MiB, and `If-Match` follow the existing write rules — previews
+    require `If-Match` as well, and of concurrent commits built on the same
+    checksum at most one succeeds.
+  - Success answers `200` with the result snapshot and its `ETag`.
+    `dryRun` (default `false`) returns only the projected result: queries,
+    history, and files are unchanged. When the result equals the current
+    content, no file is written and no revision is appended. A real commit is
+    atomic: search, tag counts, and bidirectional links reflect it
+    immediately; a save failure answers `500`/`IO_ERROR` and leaves content,
+    history, and files exactly as they were, and a restart after an
+    interrupted commit lands entirely on the pre- or post-commit state.
+  - With history enabled, each changed document gets exactly one appended
+    record: `create` for a new or reappearing id (its revision continues the
+    id's existing chain), `replace` for a modification, and `delete` for a
+    removal; older records are never changed.
+
 #### Persistent history (`--history <file>`)
 
 Passing `--history <file>` enables a durable, per-document revision ledger in

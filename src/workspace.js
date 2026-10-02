@@ -84,7 +84,10 @@ function validateOptions(options) {
   return { mode: options.mode, dryRun };
 }
 
-function normalizeSnapshot(data) {
+// Validates and normalizes a version-1 snapshot (object or JSON string),
+// enforcing the document rules, uniqueness constraints, and bound checksum.
+// Exported so other import paths (reconcile) share the exact same checks.
+export function normalizeSnapshot(data) {
   let raw = data;
   if (typeof raw === 'string') {
     try {
