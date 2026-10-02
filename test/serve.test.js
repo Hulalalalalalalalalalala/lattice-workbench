@@ -240,6 +240,72 @@ test('CRUD, search, and links follow workspace semantics', async () => {
   }
 });
 
+test('links route only counts prose references, not code samples or escapes', async () => {
+  const body = [
+    'Prose [[b]] link.',
+    'Inline `[[c]]` sample.',
+    '```',
+    '[[d]] in a fenced block',
+    '```',
+    'Escaped \\[[e]] reference.',
+    'Dangling [[ghost]] target.',
+  ].join('\n');
+  const cwd = tempDir();
+  writeSnapshot(path.join(cwd, 'snap.json'), workspaceWith([
+    { id: 'a', title: 'Alpha', body, tags: [] },
+    { id: 'b', title: 'Beta', body: 'markdown body', tags: [] },
+    { id: 'c', title: 'C', body: 'c body', tags: [] },
+    { id: 'd', title: 'D', body: 'd body', tags: [] },
+    { id: 'e', title: 'E', body: 'e body', tags: [] },
+  ]));
+  const server = await startServer([path.join(cwd, 'snap.json'), '--port', '0']);
+  try {
+    // Only the plain-prose targets (b and the not-yet-created ghost) count;
+    // inline code, the fenced block, and the escaped reference do not.
+    const links = await request(server.url, 'GET', '/documents/a/links');
+    assert.equal(links.status, 200);
+    assert.deepEqual(links.body, { outgoing: ['b', 'ghost'], incoming: [] });
+
+    // a's prose link shows up as b's incoming.
+    const bLinks = await request(server.url, 'GET', '/documents/b/links');
+    assert.deepEqual(bLinks.body, { outgoing: [], incoming: ['a'] });
+
+    // The code-only targets have no relationship to a either way.
+    for (const id of ['c', 'd', 'e']) {
+      const other = await request(server.url, 'GET', `/documents/${id}/links`);
+      assert.deepEqual(other.body, { outgoing: [], incoming: [] });
+    }
+
+    // Querying links leaves the literal code sample in the stored body.
+    const single = await request(server.url, 'GET', '/documents/a');
+    assert.equal(single.body.body, body);
+
+    // Full-text search still matches text inside the code samples.
+    const found = await request(server.url, 'GET', '/search?q=%5B%5Bc%5D%5D');
+    assert.deepEqual(found.body.map((document) => document.id), ['a']);
+
+    // The same rules apply to links created by an edit.
+    const updated = body.replace('Prose [[b]] link.', 'Prose [[b]] and [[c]] link.');
+    const etag = single.etag;
+    const put = await request(server.url, 'PUT', '/documents/a', {
+      body: { id: 'a', title: 'Alpha', body: updated, tags: [] },
+      headers: { 'if-match': etag },
+    });
+    assert.equal(put.status, 200);
+    const after = await request(server.url, 'GET', '/documents/a/links');
+    assert.deepEqual(after.body, { outgoing: ['b', 'c', 'ghost'], incoming: [] });
+    const cLinks = await request(server.url, 'GET', '/documents/c/links');
+    assert.deepEqual(cLinks.body.incoming, ['a']);
+
+    // An unknown document still fails the links query the same way.
+    const missing = await request(server.url, 'GET', '/documents/nope/links');
+    assert.equal(missing.status, 404);
+    assert.equal(missing.body.code, 'NOT_FOUND');
+  } finally {
+    await server.stop();
+  }
+});
+
 test('write validation maps to 400, 404, and 409 with stable codes', async () => {
   const cwd = tempDir();
   const file = path.join(cwd, 'snap.json');

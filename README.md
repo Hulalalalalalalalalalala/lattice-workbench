@@ -17,9 +17,48 @@ The demo creates an in-memory workspace, adds linked notes, searches their conte
 
 - Document identifiers and titles are required and unique.
 - Markdown bodies may contain `[[document-id]]` links.
+- Only references in ordinary prose create relationships; code samples and escaped references stay literal text (see below).
 - Tags are normalized to lowercase and deduplicated.
-- Search matches titles, Markdown bodies, and tags.
+- Search matches titles, Markdown bodies, and tags (including code samples).
 - Backlinks are derived from the current document set.
+
+### Wiki-link recognition
+
+A relationship exists only when a valid `[[document-id]]` reference appears in
+ordinary prose. The workspace query (`workspace.links`) and
+`GET /documents/:id/links` share one recognizer, so both always agree:
+
+- **Fenced code blocks:** a fence opens on a line starting with zero to three
+  spaces followed by at least three consecutive backticks (`` ``` ``) or
+  tildes (`~~~`), optionally followed by an info string such as a language
+  name. It closes only on a line whose marker is the same symbol, at least as
+  long as the opener, preceded by at most three spaces, and followed by only
+  spaces or tabs. A different marker, a too-short run, or trailing text does
+  not close it; without a closing fence every later reference (to the end of
+  the body) is ignored. Prose after a closed fence is recognized again.
+- **Inline code:** a span is wrapped in two equal-length runs of backticks and
+  may cross line boundaries; shorter or longer backtick runs inside it do not
+  end it. References inside a span produce no relationship. If no closing run
+  of the same length exists, the opening run is treated as ordinary text and
+  later references still count. Inline code never crosses a fenced-block
+  boundary.
+- **Escaped references:** when the run of backslashes immediately before the
+  first `[` is odd (e.g. `\[[id]]`), the reference is literal; an even run
+  still recognizes it.
+- References that never close (`[[id`) or name a target that does not satisfy
+  the identifier rules are simply ignored; they never make a links query
+  fail. LF and CRLF bodies parse identically.
+
+Everything else is unchanged: targets normalize by the same case rule,
+duplicate references appear once in the existing order, not-yet-existing
+targets stay in `outgoing`, `incoming` lists only existing documents that
+really reference the target (never the document itself), and a target present
+in both prose and code is still linked. Bodies are always stored verbatim —
+code and escapes are preserved in the body, in search results, and in JSON and
+Markdown imports/exports; querying links never edits a body, tags, or history.
+Editing a body, restoring a history revision, or importing content refreshes
+the derived relationships immediately; deleting a target never rewrites the
+referring document's body.
 
 ## JSON snapshots
 

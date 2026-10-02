@@ -1,9 +1,156 @@
 import crypto from 'node:crypto';
 
-const LINK_PATTERN = /\[\[([a-z0-9][a-z0-9._-]*)\]\]/giu;
 const SNAPSHOT_VERSION = 1;
 const SNAPSHOT_KEYS = ['version', 'documents', 'checksum'];
 const DOCUMENT_KEYS = ['id', 'title', 'body', 'tags'];
+const ID_NAME_PATTERN = /^[a-z0-9][a-z0-9._-]*$/iu;
+
+// A fenced code block opens on a line starting with 0-3 spaces and at least
+// three consecutive backticks or tildes (any trailing text is the info
+// string); the opener captures which marker and how wide it is.
+const FENCE_OPEN_PATTERN = /^ {0,3}(`{3,}|~{3,})/u;
+
+function fenceClosePattern(marker, length) {
+  // A closing fence must use the same marker, run at least as long as the
+  // opener, allow 0-3 leading spaces, and carry only spaces/tabs afterwards.
+  const escaped = marker === '`' ? '`' : '~';
+  return new RegExp(`^ {0,3}(${escaped})\\1{${length - 1},}[ \\t]*$`, 'u');
+}
+
+// Extracts the valid [[id]] references a document body makes from ordinary
+// prose. References inside fenced code blocks or inline code spans are kept
+// verbatim in the body but produce no relationship, as does a reference whose
+// first bracket is immediately preceded by an odd run of backslashes. LF and
+// CRLF endings parse identically. Shared by workspace.links() and the links
+// HTTP route, so both always follow the same rules.
+export function linksFrom(body) {
+  const targets = [];
+  const lines = String(body).split('\n');
+
+  // Prose lines accumulated between fenced blocks; inline code spans may
+  // cross physical lines, so each region is scanned as one joined segment.
+  let prose = [];
+  let fence = null; // non-null (with its closing pattern) inside a fence
+
+  const flush = () => {
+    if (prose.length > 0) {
+      scanProse(prose.join('\n'), targets);
+      prose = [];
+    }
+  };
+
+  for (const rawLine of lines) {
+    // The trailing CR of a CRLF ending is never part of fence syntax.
+    const line = rawLine.endsWith('\r') ? rawLine.slice(0, -1) : rawLine;
+    if (fence) {
+      if (fence.test(line)) fence = null;
+      // The other marker, a shorter run, or trailing text cannot close it,
+      // and an unclosed fence ignores everything through the body end.
+      continue;
+    }
+    const open = FENCE_OPEN_PATTERN.exec(line);
+    if (open) {
+      flush();
+      fence = fenceClosePattern(open[1][0], open[1].length);
+    } else {
+      prose.push(line);
+    }
+  }
+  // Prose after an unclosed fence is discarded along with the fence body.
+  if (!fence) flush();
+  return targets;
+}
+
+// Scans one fence-free segment for references, skipping inline code spans.
+// A span opens on a backtick run and closes on the first later run of exactly
+// the same length (shorter or longer runs stay inside it and never act as
+// openers themselves); spans may cross newlines but never reach across the
+// fence boundaries that delimit segments.
+function scanProse(segment, targets) {
+  const chars = Array.from(segment);
+  const spans = codeSpanIntervals(chars); // sorted, non-overlapping [start, end)
+  let i = 0;
+  let spanIndex = 0;
+  while (i < chars.length) {
+    if (spanIndex < spans.length && i === spans[spanIndex][0]) {
+      i = spans[spanIndex][1];
+      spanIndex += 1;
+      continue;
+    }
+    if (chars[i] === '[') {
+      const reference = readReference(chars, i);
+      if (reference) {
+        if (countBackslashesBefore(chars, i) % 2 === 0) {
+          targets.push(reference.name.toLowerCase());
+        }
+        i = reference.end;
+        continue;
+      }
+    }
+    i += 1;
+  }
+}
+
+function runLength(chars, start, marker) {
+  let n = 0;
+  while (start + n < chars.length && chars[start + n] === marker) n += 1;
+  return n;
+}
+
+// Builds inline-code intervals in one linear pass. Backtick runs are listed
+// left to right; `nearestSame[k]` indexes the next run of the same width
+// (precomputed right to left). A run with a match spans to that match and
+// consumes every run in between as code content; an unmatched run is literal
+// and scanning continues right after it.
+function codeSpanIntervals(chars) {
+  const runs = [];
+  for (let i = 0; i < chars.length;) {
+    if (chars[i] === '`') {
+      const length = runLength(chars, i, '`');
+      runs.push([i, i + length, length]);
+      i += length;
+    } else {
+      i += 1;
+    }
+  }
+  const nearestSame = new Array(runs.length).fill(-1);
+  const lastSeen = new Map();
+  for (let k = runs.length - 1; k >= 0; k -= 1) {
+    const length = runs[k][2];
+    if (lastSeen.has(length)) nearestSame[k] = lastSeen.get(length);
+    lastSeen.set(length, k);
+  }
+  const intervals = [];
+  for (let k = 0; k < runs.length;) {
+    const close = nearestSame[k];
+    if (close === -1) {
+      k += 1; // unmatched opening run: ordinary text
+    } else {
+      intervals.push([runs[k][0], runs[close][1]]);
+      k = close + 1;
+    }
+  }
+  return intervals;
+}
+
+function countBackslashesBefore(chars, index) {
+  let n = 0;
+  for (let i = index - 1; i >= 0 && chars[i] === '\\'; i -= 1) n += 1;
+  return n;
+}
+
+// Returns { name, end } for a syntactically complete, id-shaped [[reference]]
+// beginning at `index`, or null when the brackets do not close or the target
+// does not satisfy the existing identifier rules.
+function readReference(chars, index) {
+  if (chars[index + 1] !== '[') return null;
+  let j = index + 2;
+  while (j < chars.length && chars[j] !== ']') j += 1;
+  if (j >= chars.length || chars[j + 1] !== ']') return null;
+  const name = chars.slice(index + 2, j).join('');
+  if (!ID_NAME_PATTERN.test(name)) return null;
+  return { name, end: j + 2 };
+}
 
 export function normalizeTags(tags) {
   if (!Array.isArray(tags)) throw new TypeError('tags must be an array');
@@ -16,10 +163,6 @@ export function assertDocument(input) {
     if (typeof input[key] !== 'string' || !input[key].trim()) throw new TypeError(`${key} must be a non-empty string`);
   }
   if (!/^[a-z0-9][a-z0-9._-]*$/u.test(input.id)) throw new TypeError('id must be URL-safe lowercase text');
-}
-
-function linksFrom(body) {
-  return [...body.matchAll(LINK_PATTERN)].map((match) => match[1].toLowerCase());
 }
 
 export class SnapshotError extends Error {
