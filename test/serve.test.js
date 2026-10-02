@@ -240,6 +240,36 @@ test('CRUD, search, and links follow workspace semantics', async () => {
   }
 });
 
+test('GET /documents/:id/links applies the code-aware link rules', async () => {
+  const cwd = tempDir();
+  writeSnapshot(path.join(cwd, 'snap.json'), workspaceWith([
+    { id: 'a', title: 'Alpha', body: 'prose [[b]]\n```\n[[ghost]]\n```\n`[[ghost]]`\n\\[[escaped]]', tags: [] },
+    { id: 'b', title: 'Beta', body: '[[a]] `[[a]]`', tags: [] },
+  ]));
+  const server = await startServer([path.join(cwd, 'snap.json'), '--port', '0']);
+  try {
+    const linksA = await request(server.url, 'GET', '/documents/a/links');
+    assert.equal(linksA.status, 200);
+    assert.deepEqual(linksA.body, { outgoing: ['b'], incoming: ['b'] });
+    const linksB = await request(server.url, 'GET', '/documents/b/links');
+    assert.deepEqual(linksB.body, { outgoing: ['a'], incoming: ['a'] });
+    // Full-text search still finds text inside code samples.
+    const search = await request(server.url, 'GET', '/search?q=ghost');
+    assert.deepEqual(search.body.map((document) => document.id), ['a']);
+    // Editing the body updates links immediately.
+    const listed = await request(server.url, 'GET', '/documents');
+    const replaced = await request(server.url, 'PUT', '/documents/a', {
+      body: { id: 'a', title: 'Alpha', body: '```\n[[b]]\n```', tags: [] },
+      headers: { 'if-match': listed.etag },
+    });
+    assert.equal(replaced.status, 200);
+    const after = await request(server.url, 'GET', '/documents/a/links');
+    assert.deepEqual(after.body, { outgoing: [], incoming: ['b'] });
+  } finally {
+    await server.stop();
+  }
+});
+
 test('write validation maps to 400, 404, and 409 with stable codes', async () => {
   const cwd = tempDir();
   const file = path.join(cwd, 'snap.json');

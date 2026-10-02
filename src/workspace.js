@@ -1,6 +1,7 @@
 import crypto from 'node:crypto';
 
-const LINK_PATTERN = /\[\[([a-z0-9][a-z0-9._-]*)\]\]/giu;
+const LINK_TARGET = /[a-z0-9][a-z0-9._-]*/giu;
+const FENCE_LINE = /^ {0,3}(`{3,}|~{3,})(.*)$/u;
 const SNAPSHOT_VERSION = 1;
 const SNAPSHOT_KEYS = ['version', 'documents', 'checksum'];
 const DOCUMENT_KEYS = ['id', 'title', 'body', 'tags'];
@@ -18,8 +19,115 @@ export function assertDocument(input) {
   if (!/^[a-z0-9][a-z0-9._-]*$/u.test(input.id)) throw new TypeError('id must be URL-safe lowercase text');
 }
 
+// Matches a fenced-code-block line: 0-3 leading spaces, a run of at least
+// three identical backticks or tildes, then an optional info string. Returns
+// null for any other line.
+function fenceOf(line) {
+  const match = FENCE_LINE.exec(line);
+  if (!match) return null;
+  return { char: match[1][0], length: match[1].length, info: match[2] };
+}
+
+// Scans a stretch of ordinary prose (never inside a fence) for wiki links.
+// Inline code spans of equal-length backtick runs are skipped; a run with no
+// matching closer is literal text and later links still count. A [[ whose first
+// bracket is immediately preceded by an odd run of backslashes is escaped.
+function scanProse(region) {
+  const found = [];
+  const length = region.length;
+  let index = 0;
+  while (index < length) {
+    const char = region[index];
+    if (char === '`') {
+      let runEnd = index;
+      while (runEnd < length && region[runEnd] === '`') runEnd += 1;
+      const runLength = runEnd - index;
+      let search = runEnd;
+      let close = -1;
+      while (search < length) {
+        if (region[search] === '`') {
+          let spanEnd = search;
+          while (spanEnd < length && region[spanEnd] === '`') spanEnd += 1;
+          if (spanEnd - search === runLength) {
+            close = search;
+            break;
+          }
+          search = spanEnd;
+        } else {
+          search += 1;
+        }
+      }
+      if (close === -1) {
+        index = runEnd;
+      } else {
+        index = close + runLength;
+      }
+    } else if (char === '[' && region[index + 1] === '[') {
+      let backslashes = 0;
+      let cursor = index - 1;
+      while (cursor >= 0 && region[cursor] === '\\') {
+        backslashes += 1;
+        cursor -= 1;
+      }
+      if (backslashes % 2 === 1) {
+        index += 2;
+        continue;
+      }
+      const targetStart = index + 2;
+      LINK_TARGET.lastIndex = targetStart;
+      const match = LINK_TARGET.exec(region);
+      if (
+        match
+        && match.index === targetStart
+        && region[targetStart + match[0].length] === ']'
+        && region[targetStart + match[0].length + 1] === ']'
+      ) {
+        found.push(match[0].toLowerCase());
+        index = targetStart + match[0].length + 2;
+      } else {
+        index += 1;
+      }
+    } else {
+      index += 1;
+    }
+  }
+  return found;
+}
+
+// Extracts the wiki-link targets that count as relationships from a body:
+// links in ordinary prose only. Fenced code blocks and inline code spans are
+// ignored, escaped brackets are literal, and malformed or dangling references
+// are skipped without affecting anything else.
 function linksFrom(body) {
-  return [...body.matchAll(LINK_PATTERN)].map((match) => match[1].toLowerCase());
+  const text = body.replace(/\r\n?/gu, '\n');
+  const lines = text.split('\n');
+  const found = [];
+  let inFence = false;
+  let fenceChar = '';
+  let fenceLength = 0;
+  let regionStart = 0;
+  let lineStart = 0;
+  for (const line of lines) {
+    const nextStart = lineStart + line.length + 1;
+    if (inFence) {
+      const closing = fenceOf(line);
+      if (closing && closing.char === fenceChar && closing.length >= fenceLength && /^[ \t]*$/u.test(closing.info)) {
+        inFence = false;
+        regionStart = nextStart;
+      }
+    } else {
+      const opening = fenceOf(line);
+      if (opening) {
+        found.push(...scanProse(text.slice(regionStart, lineStart)));
+        inFence = true;
+        fenceChar = opening.char;
+        fenceLength = opening.length;
+      }
+    }
+    lineStart = nextStart;
+  }
+  if (!inFence) found.push(...scanProse(text.slice(regionStart)));
+  return [...new Set(found)];
 }
 
 export class SnapshotError extends Error {
