@@ -289,6 +289,150 @@ test('export rejects an un-encodable snapshot without touching an existing targe
   assert.equal(fs.readFileSync(path.join(target, 'untouched'), 'utf8'), 'yes');
 });
 
+test('export refuses a source inside the staging or backup location and changes nothing', () => {
+  const snapshotTree = (root) => {
+    const walk = (directory) => {
+      const entries = {};
+      for (const name of fs.readdirSync(directory).sort()) {
+        const full = path.join(directory, name);
+        const stats = fs.lstatSync(full);
+        if (stats.isSymbolicLink()) entries[name] = `<symlink:${fs.readlinkSync(full)}>`;
+        else if (stats.isDirectory()) entries[name] = walk(full);
+        else entries[name] = fs.readFileSync(full);
+      }
+      return entries;
+    };
+    return walk(root);
+  };
+
+  const variants = [
+    (dir) => {
+      // Leftover staging directory from a killed previous export.
+      const stage = path.join(dir, 'pkg.export.tmp');
+      fs.mkdirSync(stage);
+      fs.writeFileSync(path.join(stage, 'partial.md'), 'partial');
+      fs.writeFileSync(path.join(stage, 'snap.json'), fs.readFileSync(path.join(dir, 'snap.json')));
+      return { source: path.join(stage, 'snap.json'), output: path.join(dir, 'pkg') };
+    },
+    (dir) => {
+      // Leftover backup directory holding the source snapshot.
+      const backup = path.join(dir, 'pkg.old.tmp');
+      fs.mkdirSync(backup);
+      fs.writeFileSync(path.join(backup, 'snap.json'), fs.readFileSync(path.join(dir, 'snap.json')));
+      return { source: path.join(backup, 'snap.json'), output: path.join(dir, 'pkg') };
+    },
+    (dir) => {
+      // The scratch location itself is the snapshot file (exact equality).
+      const stage = path.join(dir, 'pkg.export.tmp');
+      fs.writeFileSync(stage, fs.readFileSync(path.join(dir, 'snap.json')));
+      return { source: stage, output: path.join(dir, 'pkg') };
+    },
+  ];
+  for (let index = 0; index < variants.length; index += 1) {
+    const cwd = tempDir();
+    writeSnapshot(path.join(cwd, 'snap.json'), workspaceWith([{ id: 'a', title: 'A', body: 'b', tags: [] }]));
+    // A pre-existing target with content the rejection must leave in place.
+    fs.mkdirSync(path.join(cwd, 'pkg'));
+    fs.writeFileSync(path.join(cwd, 'pkg', 'untouched'), 'yes');
+
+    const { source, output } = variants[index](cwd);
+    const before = snapshotTree(cwd);
+    assert.throws(
+      () => exportMarkdown(source, output),
+      (error) => error.code === 'INVALID_OPTIONS',
+      `variant ${index}`,
+    );
+    // No path under cwd was deleted, moved, created, or rewritten.
+    assert.deepEqual(snapshotTree(cwd), before, `variant ${index}`);
+  }
+});
+
+test('export refuses a source equal to the output path even when the target already exists', () => {
+  const cwd = tempDir();
+  const workspace = workspaceWith([{ id: 'a', title: 'A', body: 'b', tags: [] }]);
+  // The output path is itself a regular file holding the source snapshot.
+  const samePath = path.join(cwd, 'snapshot-and-target.json');
+  fs.writeFileSync(samePath, `${JSON.stringify(workspace.exportJSON())}\n`);
+  const before = fs.readFileSync(samePath);
+
+  assert.throws(
+    () => exportMarkdown(samePath, samePath),
+    (error) => error.code === 'INVALID_OPTIONS',
+  );
+  assert.deepEqual(fs.readFileSync(samePath), before);
+  assert.ok(!fs.existsSync(`${samePath}.export.tmp`));
+  assert.ok(!fs.existsSync(`${samePath}.old.tmp`));
+});
+
+test('staging/backup overlap is detected through symlinked parents before the output exists', () => {
+  const cwd = tempDir();
+  const workspace = workspaceWith([{ id: 'a', title: 'A', body: 'b', tags: [] }]);
+  const scratches = path.join(cwd, 'scratches');
+  fs.mkdirSync(scratches);
+  fs.mkdirSync(path.join(scratches, 'pkg.export.tmp'));
+  writeSnapshot(path.join(scratches, 'pkg.export.tmp', 's.json'), workspace);
+  fs.symlinkSync('scratches', path.join(cwd, 'alias'));
+
+  // Textually different path, same real scratch location; pkg/ does not exist yet.
+  assert.throws(
+    () => exportMarkdown(
+      path.join(cwd, 'alias', 'pkg.export.tmp', 's.json'),
+      path.join(cwd, 'scratches', 'pkg'),
+    ),
+    (error) => error.code === 'INVALID_OPTIONS',
+  );
+  assert.deepEqual(
+    fs.readFileSync(path.join(scratches, 'pkg.export.tmp', 's.json'), 'utf8'),
+    `${JSON.stringify(workspace.exportJSON())}\n`,
+  );
+  assert.ok(!fs.existsSync(path.join(scratches, 'pkg')));
+  assert.ok(!fs.existsSync(path.join(scratches, 'pkg.old.tmp')));
+});
+
+test('snapshots merely named like scratch locations export normally', () => {
+  const cwd = tempDir();
+  const workspace = workspaceWith([{ id: 'a', title: 'A', body: 'b', tags: [] }]);
+
+  // A sibling directory whose name shares the staging suffix.
+  fs.mkdirSync(path.join(cwd, 'my-pkg.export.tmp'));
+  writeSnapshot(path.join(cwd, 'my-pkg.export.tmp', 's.json'), workspace);
+  // A sibling file whose name contains the backup wording.
+  writeSnapshot(path.join(cwd, 'pkg.old.tmp.maybe.json'), workspace);
+
+  exportMarkdown(path.join(cwd, 'my-pkg.export.tmp', 's.json'), path.join(cwd, 'pkg'));
+  assert.deepEqual(fs.readdirSync(path.join(cwd, 'pkg')).sort(), ['a.md', 'manifest.json']);
+  assert.deepEqual(
+    fs.readFileSync(path.join(cwd, 'my-pkg.export.tmp', 's.json'), 'utf8'),
+    `${JSON.stringify(workspace.exportJSON())}\n`,
+  );
+
+  const second = path.join(cwd, 'pkg2');
+  exportMarkdown(path.join(cwd, 'pkg.old.tmp.maybe.json'), second);
+  assert.deepEqual(fs.readdirSync(second).sort(), ['a.md', 'manifest.json']);
+  assert.ok(fs.existsSync(path.join(cwd, 'pkg.old.tmp.maybe.json')));
+});
+
+test('CLI export-md fails with status 1 when the source sits in the staging directory', () => {
+  const cwd = tempDir();
+  writeSnapshot(path.join(cwd, 'snap.json'), workspaceWith([{ id: 'a', title: 'A', body: 'b', tags: [] }]));
+  fs.mkdirSync(path.join(cwd, 'pkg.export.tmp'));
+  const source = path.join(cwd, 'pkg.export.tmp', 's.json');
+  fs.writeFileSync(source, fs.readFileSync(path.join(cwd, 'snap.json')));
+
+  const { status, stdout, stderr } = runCli(
+    ['export-md', path.join('pkg.export.tmp', 's.json'), 'pkg'],
+    cwd,
+  );
+  assert.equal(status, 1);
+  assert.equal(stdout, '');
+  const lines = stderr.split('\n');
+  assert.equal(lines.length, 2);
+  assert.equal(lines[1], '');
+  assert.equal(JSON.parse(lines[0]).code, 'INVALID_OPTIONS');
+  assert.deepEqual(fs.readFileSync(source), fs.readFileSync(path.join(cwd, 'snap.json')));
+  assert.ok(!fs.existsSync(path.join(cwd, 'pkg')));
+});
+
 test('path options are compared by real location', () => {
   const cwd = tempDir();
   writeSnapshot(path.join(cwd, 'snap.json'), workspaceWith([{ id: 'a', title: 'A', body: 'b', tags: [] }]));

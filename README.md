@@ -165,7 +165,13 @@ The package directory contains `manifest.json` and one `<id>.md` per document:
 `export-md` prints exactly one line: the manifest JSON (the same bytes written
 to `manifest.json`). An existing target directory is replaced wholesale via a
 sibling staging directory and a single rename, so old files never linger and a
-retry after the process was killed completes a fresh package.
+retry after the process was killed completes a fresh package. The fixed
+staging (`<output-directory>.export.tmp`) and backup
+(`<output-directory>.old.tmp`) locations are cleared at the start of an export,
+so a source snapshot that is either location itself or a file inside it — just
+like one inside the target directory — is rejected with `INVALID_OPTIONS`
+before anything is read, cleared, moved, or written; names that merely resemble
+those scratch paths elsewhere on disk are unaffected.
 
 `import-md` normalizes titles and tags under the existing document rules,
 verifies every file digest and the rebuilt snapshot's bound checksum, then
@@ -184,7 +190,7 @@ standard error is exactly one JSON line carrying a `code`, the process exits
 | Code | When |
 | --- | --- |
 | `INVALID_MARKDOWN` | Manifest version/field/type errors, duplicate ids or normalized titles, illegal UTF-8, a digest or checksum mismatch, a missing or extra file, an un-encodable body on export, or a package whose input directory is itself a symlink or contains a symlink, subdirectory, special file, or illegal file name. |
-| `INVALID_OPTIONS` | Wrong argument count or mode, an unknown flag (including `--dry-run` for `export-md`), an export target that is a symlink or contains the source snapshot, or an import output placed inside the input package. Path aliases are compared by their resolved real locations. |
+| `INVALID_OPTIONS` | Wrong argument count or mode, an unknown flag (including `--dry-run` for `export-md`), an export target that is a symlink, or a source snapshot that is or lies inside the export's output, staging, or backup location, or an import output placed inside the input package. Path aliases are compared by their resolved real locations (including the real parent of a not-yet-created output). |
 | `IO_ERROR` | Any failure reading an input or writing the package/snapshot. |
 
 The package is read strictly: symlinked directories or entries are refused and

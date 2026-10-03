@@ -300,11 +300,26 @@ export function exportMarkdown(snapshotFile, outputDirectory) {
     throw new SnapshotError('INVALID_OPTIONS', 'output directory must not be a symlink');
   }
 
+  // Fixed staging/backup names used below. They are computed before any check
+  // so the source can be protected against all three locations the export
+  // replaces or removes — not just the final output directory.
+  const stage = `${output}.export.tmp`;
+  const backup = `${output}.old.tmp`;
+
   // Path-option checks precede reading so an invalid layout is reported even
-  // when the source itself would be unreadable.
+  // when the source itself would be unreadable. The source snapshot is user
+  // input: it must never be deleted, moved, or rewritten merely because it
+  // sits at (or inside) the output directory or either scratch location this
+  // export is about to clear or swap. All comparisons use real locations so
+  // paths reached through symlinked parents alias correctly even when the
+  // output leaf does not exist yet.
   const sourceReal = realLocation(snapshotFile);
-  if (isInside(sourceReal, realLocation(output))) {
-    throw new SnapshotError('INVALID_OPTIONS', 'output directory must not contain the source snapshot');
+  const protectedLocations = [realLocation(output), realLocation(stage), realLocation(backup)];
+  if (protectedLocations.some((location) => isInside(sourceReal, location))) {
+    throw new SnapshotError(
+      'INVALID_OPTIONS',
+      'source snapshot must not be the output directory or an export staging or backup location',
+    );
   }
 
   const snapshotText = readSnapshotText(snapshotFile);
@@ -315,8 +330,6 @@ export function exportMarkdown(snapshotFile, outputDirectory) {
   const snapshot = workspace.exportJSON();
   const { files, manifestText } = buildPackage(snapshot);
 
-  const stage = `${output}.export.tmp`;
-  const backup = `${output}.old.tmp`;
   // Clear leftovers from a previously killed attempt first.
   removeQuiet(stage);
   removeQuiet(backup);
