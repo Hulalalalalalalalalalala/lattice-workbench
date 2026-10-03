@@ -164,8 +164,16 @@ The package directory contains `manifest.json` and one `<id>.md` per document:
 
 `export-md` prints exactly one line: the manifest JSON (the same bytes written
 to `manifest.json`). An existing target directory is replaced wholesale via a
-sibling staging directory and a single rename, so old files never linger and a
-retry after the process was killed completes a fresh package.
+sibling staging directory (`<output>.export.tmp`) and a single rename, with the
+previous directory briefly held in `<output>.old.tmp`, so old files never
+linger and a retry after the process was killed completes a fresh package.
+
+The source snapshot is user input and is never cleaned up with the export's
+working directories: it must not be the output directory or either fixed
+staging/backup directory, and must not live inside any of them. Such a layout
+is refused with `INVALID_OPTIONS` before the snapshot is read and before
+anything is deleted or moved, whether or not the target directory already
+exists, so the source and every pre-existing entry are left untouched.
 
 `import-md` normalizes titles and tags under the existing document rules,
 verifies every file digest and the rebuilt snapshot's bound checksum, then
@@ -184,7 +192,7 @@ standard error is exactly one JSON line carrying a `code`, the process exits
 | Code | When |
 | --- | --- |
 | `INVALID_MARKDOWN` | Manifest version/field/type errors, duplicate ids or normalized titles, illegal UTF-8, a digest or checksum mismatch, a missing or extra file, an un-encodable body on export, or a package whose input directory is itself a symlink or contains a symlink, subdirectory, special file, or illegal file name. |
-| `INVALID_OPTIONS` | Wrong argument count or mode, an unknown flag (including `--dry-run` for `export-md`), an export target that is a symlink or contains the source snapshot, or an import output placed inside the input package. Path aliases are compared by their resolved real locations. |
+| `INVALID_OPTIONS` | Wrong argument count or mode, an unknown flag (including `--dry-run` for `export-md`), an export target that is a symlink, or an export source snapshot that is the output, staging, or backup directory or lies inside one of them, or an import output placed inside the input package. Path aliases are compared by their resolved real locations. |
 | `IO_ERROR` | Any failure reading an input or writing the package/snapshot. |
 
 The package is read strictly: symlinked directories or entries are refused and

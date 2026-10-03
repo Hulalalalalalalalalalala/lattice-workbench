@@ -289,6 +289,129 @@ test('export rejects an un-encodable snapshot without touching an existing targe
   assert.equal(fs.readFileSync(path.join(target, 'untouched'), 'utf8'), 'yes');
 });
 
+test('export refuses a source snapshot in the output, staging, or backup location without deleting it', () => {
+  const cwd = tempDir();
+  const rootSnapshot = path.join(cwd, 'snap.json');
+  writeSnapshot(rootSnapshot, workspaceWith(sampleDocuments));
+
+  // Each layout returns { source, output, watch }: paths whose exact bytes must
+  // survive the refusal, plus assertions that no package directory appears.
+  const layouts = [
+    (dir) => {
+      const target = path.join(dir, 'pkg');
+      fs.mkdirSync(target);
+      fs.writeFileSync(path.join(target, 'keep.txt'), 'keep');
+      fs.copyFileSync(rootSnapshot, path.join(target, 'snap.json'));
+      return { source: path.join(target, 'snap.json'), output: target, watch: [path.join(target, 'snap.json'), path.join(target, 'keep.txt')] };
+    },
+    (dir) => {
+      const target = path.join(dir, 'pkg');
+      fs.mkdirSync(`${target}.export.tmp`);
+      fs.copyFileSync(rootSnapshot, `${target}.export.tmp/snap.json`);
+      return { source: `${target}.export.tmp/snap.json`, output: target, watch: [`${target}.export.tmp/snap.json`] };
+    },
+    (dir) => {
+      const target = path.join(dir, 'pkg');
+      fs.mkdirSync(`${target}.old.tmp`);
+      fs.copyFileSync(rootSnapshot, `${target}.old.tmp/snap.json`);
+      return { source: `${target}.old.tmp/snap.json`, output: target, watch: [`${target}.old.tmp/snap.json`] };
+    },
+    (dir) => {
+      // Source path is literally the staging path (a file named like it).
+      const target = path.join(dir, 'pkg');
+      fs.copyFileSync(rootSnapshot, `${target}.export.tmp`);
+      return { source: `${target}.export.tmp`, output: target, watch: [`${target}.export.tmp`] };
+    },
+  ];
+
+  layouts.forEach((layout, index) => {
+    const dir = path.join(cwd, `layout-${index}`);
+    fs.mkdirSync(dir);
+    const { source, output, watch } = layout(dir);
+    const existed = fs.existsSync(output);
+    const before = new Map(watch.map((file) => [file, fs.readFileSync(file)]));
+    assert.throws(
+      () => exportMarkdown(source, output),
+      (error) => error.code === 'INVALID_OPTIONS',
+      `layout ${index}`,
+    );
+    for (const [file, bytes] of before) {
+      assert.ok(fs.existsSync(file), `layout ${index}: ${file} survives`);
+      assert.deepEqual(fs.readFileSync(file), bytes, `layout ${index}: ${file} unchanged`);
+    }
+    if (existed) {
+      // A pre-existing target directory is preserved, with no package written.
+      assert.ok(fs.statSync(output).isDirectory(), `layout ${index}: target directory preserved`);
+      assert.ok(!fs.existsSync(path.join(output, 'manifest.json')), `layout ${index}: no manifest emitted`);
+    } else {
+      assert.ok(!fs.existsSync(output), `layout ${index}: target never created`);
+    }
+  });
+});
+
+test('export staging/backup overlap is detected through symlinked parents of a missing target', () => {
+  const cwd = tempDir();
+  writeSnapshot(path.join(cwd, 'snap.json'), workspaceWith([{ id: 'a', title: 'A', body: 'b', tags: [] }]));
+  fs.mkdirSync(path.join(cwd, 'deep', 'real'), { recursive: true });
+  fs.symlinkSync('real', path.join(cwd, 'deep', 'r'));
+  // The target leaf 'deep/r/pkg' does not exist; its staging directory resolves
+  // through the alias to 'deep/real/pkg.export.tmp'.
+  fs.mkdirSync(path.join(cwd, 'deep', 'real', 'pkg.export.tmp'));
+  fs.writeFileSync(
+    path.join(cwd, 'deep', 'real', 'pkg.export.tmp', 's.json'),
+    fs.readFileSync(path.join(cwd, 'snap.json')),
+  );
+  assert.throws(
+    () => exportMarkdown(
+      path.join(cwd, 'deep', 'r', 'pkg.export.tmp', 's.json'),
+      path.join(cwd, 'deep', 'r', 'pkg'),
+    ),
+    (error) => error.code === 'INVALID_OPTIONS',
+  );
+  assert.ok(fs.existsSync(path.join(cwd, 'deep', 'real', 'pkg.export.tmp', 's.json')));
+  assert.ok(!fs.existsSync(path.join(cwd, 'deep', 'real', 'pkg')));
+});
+
+test('CLI export-md refuses a staging-location snapshot without deleting it', () => {
+  const cwd = tempDir();
+  writeSnapshot(path.join(cwd, 'snap.json'), workspaceWith(sampleDocuments));
+  fs.mkdirSync(path.join(cwd, 'pkg.export.tmp'));
+  fs.copyFileSync(path.join(cwd, 'snap.json'), path.join(cwd, 'pkg.export.tmp', 'snap.json'));
+
+  const result = runCli(['export-md', 'pkg.export.tmp/snap.json', 'pkg'], cwd);
+  assert.equal(result.status, 1);
+  assert.equal(result.stdout, '');
+  const lines = result.stderr.split('\n');
+  assert.equal(lines.length, 2);
+  assert.equal(lines[1], '');
+  assert.equal(JSON.parse(lines[0]).code, 'INVALID_OPTIONS');
+  assert.ok(fs.existsSync(path.join(cwd, 'pkg.export.tmp', 'snap.json')), 'source snapshot survives');
+  assert.deepEqual(
+    fs.readFileSync(path.join(cwd, 'pkg.export.tmp', 'snap.json')),
+    fs.readFileSync(path.join(cwd, 'snap.json')),
+  );
+  assert.ok(!fs.existsSync(path.join(cwd, 'pkg')), 'no package emitted');
+});
+
+test('a safe source outside the output/staging/backup locations is not rejected for its name', () => {
+  const cwd = tempDir();
+  writeSnapshot(path.join(cwd, 'snap.export.tmp.json'), workspaceWith([{ id: 'a', title: 'A', body: 'b', tags: [] }]));
+  fs.mkdirSync(path.join(cwd, 'pkg-old.tmp-backups'));
+  writeSnapshot(
+    path.join(cwd, 'pkg-old.tmp-backups', 'snap.json'),
+    workspaceWith([{ id: 'a', title: 'A', body: 'b', tags: [] }]),
+  );
+
+  const { manifestText } = exportMarkdown(path.join(cwd, 'snap.export.tmp.json'), path.join(cwd, 'pkg'));
+  assert.equal(fs.readFileSync(path.join(cwd, 'pkg', 'manifest.json'), 'utf8'), manifestText);
+  assert.ok(fs.existsSync(path.join(cwd, 'snap.export.tmp.json')));
+
+  assert.doesNotThrow(
+    () => exportMarkdown(path.join(cwd, 'pkg-old.tmp-backups', 'snap.json'), path.join(cwd, 'pkg2')),
+  );
+  assert.ok(fs.existsSync(path.join(cwd, 'pkg-old.tmp-backups', 'snap.json')));
+});
+
 test('path options are compared by real location', () => {
   const cwd = tempDir();
   writeSnapshot(path.join(cwd, 'snap.json'), workspaceWith([{ id: 'a', title: 'A', body: 'b', tags: [] }]));

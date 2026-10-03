@@ -300,11 +300,28 @@ export function exportMarkdown(snapshotFile, outputDirectory) {
     throw new SnapshotError('INVALID_OPTIONS', 'output directory must not be a symlink');
   }
 
+  // Fixed sibling names used to replace the target wholesale and to finish a
+  // killed retry; both are removed before the package is built.
+  const stage = `${output}.export.tmp`;
+  const backup = `${output}.old.tmp`;
+
   // Path-option checks precede reading so an invalid layout is reported even
-  // when the source itself would be unreadable.
+  // when the source itself would be unreadable, and before any location the
+  // export deletes or replaces is touched. The source snapshot is user input:
+  // it must never be the target directory or the staging/backup directory,
+  // nor live inside any of them, or the cleanup below could delete a snapshot
+  // that was already read successfully. Real locations make aliased paths
+  // (including symlinked parents of a not-yet-created target) compare equal.
   const sourceReal = realLocation(snapshotFile);
-  if (isInside(sourceReal, realLocation(output))) {
-    throw new SnapshotError('INVALID_OPTIONS', 'output directory must not contain the source snapshot');
+  const scratchLocations = [
+    { real: realLocation(output), message: 'output directory must not contain the source snapshot' },
+    { real: realLocation(stage), message: 'source snapshot must not be in the export staging directory' },
+    { real: realLocation(backup), message: 'source snapshot must not be in the export backup directory' },
+  ];
+  for (const location of scratchLocations) {
+    if (isInside(sourceReal, location.real)) {
+      throw new SnapshotError('INVALID_OPTIONS', location.message);
+    }
   }
 
   const snapshotText = readSnapshotText(snapshotFile);
@@ -315,8 +332,6 @@ export function exportMarkdown(snapshotFile, outputDirectory) {
   const snapshot = workspace.exportJSON();
   const { files, manifestText } = buildPackage(snapshot);
 
-  const stage = `${output}.export.tmp`;
-  const backup = `${output}.old.tmp`;
   // Clear leftovers from a previously killed attempt first.
   removeQuiet(stage);
   removeQuiet(backup);
