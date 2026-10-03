@@ -5,6 +5,10 @@ import { reconcileSnapshots } from './reconcile.js';
 
 const MAX_BODY_BYTES = 1024 * 1024;
 const ETAG_PATTERN = /^"[0-9a-f]{64}"$/u;
+// Bodies must be valid UTF-8: a fatal decode rejects malformed byte sequences
+// instead of letting Buffer's default decoder rewrite them to U+FFFD. A
+// leading BOM is preserved (as before) rather than stripped by the decoder.
+const fatalUtf8 = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
 const ID_PATTERN = /^[a-z0-9][a-z0-9._-]*$/u;
 const DOCUMENT_FIELDS = new Set(['id', 'title', 'body', 'tags']);
 const BATCH_ACTIONS = new Set(['create', 'replace', 'delete', 'restore']);
@@ -57,7 +61,16 @@ async function readBody(req) {
     }
     chunks.push(chunk);
   }
-  return Buffer.concat(chunks).toString('utf8');
+  const bytes = Buffer.concat(chunks);
+  // Decode the complete buffer so a multibyte character split across network
+  // chunks reassembles; a fatal decode refuses to mask invalid bytes. The 1 MiB
+  // limit has already been enforced on the raw bytes above, so an oversized
+  // body reports 413 even when it also contains invalid UTF-8.
+  try {
+    return fatalUtf8.decode(bytes);
+  } catch {
+    throw new HttpError(400, 'INVALID_JSON', 'request body is not valid UTF-8');
+  }
 }
 
 function parseJson(text) {
