@@ -294,6 +294,16 @@ function validateReconcileRequest(data) {
   return { base: data.base, incoming: data.incoming, dryRun };
 }
 
+// Builds an independent, mutable copy of a workspace. Every committed
+// projection is prepared on such a copy and only swapped in after its
+// snapshot has been saved, so a failed save or a rejected business check
+// never mutates the live state.
+function cloneWorkspace(source) {
+  const candidate = new Workspace();
+  for (const document of source.list()) candidate.add(document);
+  return candidate;
+}
+
 // A document server holds one Workspace and, when a history store is supplied,
 // a per-document revision ledger. Every committed change is persisted through
 // `save(snapshot, historySnapshot)` before the in-memory state is swapped, so a
@@ -328,23 +338,33 @@ export function createDocumentServer({ workspace, save, history = null }) {
     }
   }
 
-  // Builds the next state on a candidate workspace and lets `mutate` append to
-  // the next ledger. The callback returns false to signal a content-preserving
-  // write (normalized content unchanged): the request still succeeds, but no
-  // revision is appended and nothing is persisted.
-  function commit(mutate) {
-    const candidate = new Workspace();
-    for (const document of current.list()) candidate.add(document);
+  // Single commit rule shared by every write route. `project` runs against a
+  // fresh workspace copy (and a cloned ledger when history is enabled) and
+  // returns `{ changed, extra }`; it may throw to reject the request before
+  // any save. When `changed` is false the normalized content is identical:
+  // the request still succeeds on the current snapshot, but no file is
+  // written, no revision appended, and the ETag is unchanged. When `dryRun`
+  // is true the projected snapshot is returned without touching memory,
+  // history, or files. Otherwise the result snapshot and its ledger export
+  // are saved first; the in-memory state is swapped in only once the save
+  // succeeds, so every subsequent read (document, search, tags, links,
+  // history) observes the full commit and a failed save leaves the request
+  // fully uncommitted.
+  function commitChange(project, { dryRun = false } = {}) {
+    const candidate = cloneWorkspace(current);
     const nextLedger = ledger ? ledger.clone() : null;
-    const changed = mutate(candidate, nextLedger);
-    if (changed === false) {
-      return current.exportJSON();
+    const { changed = true, extra } = project(candidate, nextLedger) ?? {};
+    if (!changed) {
+      return { snapshot: current.exportJSON(), extra };
     }
     const snapshot = candidate.exportJSON();
+    if (dryRun) {
+      return { snapshot, extra };
+    }
     save(snapshot, nextLedger ? nextLedger.exportJSON(snapshot.checksum) : null);
     current = candidate;
     ledger = nextLedger;
-    return snapshot;
+    return { snapshot, extra };
   }
 
   // Applies every operation in one atomic step. Existence and restore-version
@@ -352,9 +372,9 @@ export function createDocumentServer({ workspace, save, history = null }) {
   // if any operation would fail. Title conflicts are checked against the final
   // projected set, making swaps and release-then-reuse independent of
   // operation order. Each actually-changed document appends one record; a
-  // normalized-identical replace or restore appends nothing. Returns
-  // `{ snapshot, changed }` without persisting when `dryRun` is true or the
-  // batch is content-preserving.
+  // normalized-identical replace or restore appends nothing. The shared
+  // commit rule skips persistence when the batch is content-preserving or a
+  // preview.
   function commitBatch(operations, dryRun) {
     // Pre-commit state checks.
     for (const op of operations) {
@@ -388,78 +408,67 @@ export function createDocumentServer({ workspace, save, history = null }) {
       }
     }
 
-    const candidate = new Workspace();
-    for (const document of current.list()) candidate.add(document);
-    const nextLedger = ledger ? ledger.clone() : null;
-
-    let changed = false;
-    for (const op of operations) {
-      if (op.type === 'create') {
-        candidate.add(op.document);
-        if (nextLedger) nextLedger.record(op.document.id, 'create', candidate.get(op.document.id));
-        changed = true;
-      } else if (op.type === 'replace') {
-        const before = current.get(op.document.id);
-        candidate.remove(op.document.id);
-        candidate.add(op.document);
-        const stored = candidate.get(op.document.id);
-        if (!sameDocument(before, stored)) {
-          if (nextLedger) nextLedger.record(op.document.id, 'replace', stored);
+    const { snapshot, extra } = commitChange((candidate, nextLedger) => {
+      let changed = false;
+      for (const op of operations) {
+        if (op.type === 'create') {
+          candidate.add(op.document);
+          if (nextLedger) nextLedger.record(op.document.id, 'create', candidate.get(op.document.id));
           changed = true;
-        }
-      } else if (op.type === 'delete') {
-        candidate.remove(op.id);
-        if (nextLedger) nextLedger.record(op.id, 'delete', null);
-        changed = true;
-      } else if (op.type === 'restore') {
-        const before = current.get(op.id);
-        const target = ledger.entry(op.id, op.revision);
-        candidate.remove(op.id);
-        candidate.add(target.document);
-        const stored = candidate.get(op.id);
-        if (!before || !sameDocument(before, stored)) {
-          nextLedger.record(op.id, 'restore', stored);
+        } else if (op.type === 'replace') {
+          const before = current.get(op.document.id);
+          candidate.remove(op.document.id);
+          candidate.add(op.document);
+          const stored = candidate.get(op.document.id);
+          if (!sameDocument(before, stored)) {
+            if (nextLedger) nextLedger.record(op.document.id, 'replace', stored);
+            changed = true;
+          }
+        } else if (op.type === 'delete') {
+          candidate.remove(op.id);
+          if (nextLedger) nextLedger.record(op.id, 'delete', null);
           changed = true;
+        } else if (op.type === 'restore') {
+          const before = current.get(op.id);
+          const target = ledger.entry(op.id, op.revision);
+          candidate.remove(op.id);
+          candidate.add(target.document);
+          const stored = candidate.get(op.id);
+          if (!before || !sameDocument(before, stored)) {
+            nextLedger.record(op.id, 'restore', stored);
+            changed = true;
+          }
         }
       }
-    }
 
-    // Title conflicts are checked against the final projected set, so
-    // operation order cannot make a swap or release-then-reuse fail.
-    const titles = new Set();
-    for (const document of candidate.list()) {
-      if (titles.has(document.title)) {
-        throw new HttpError(409, 'CONFLICT', `title conflict in batch: ${document.title}`);
+      // Title conflicts are checked against the final projected set, so
+      // operation order cannot make a swap or release-then-reuse fail.
+      const titles = new Set();
+      for (const document of candidate.list()) {
+        if (titles.has(document.title)) {
+          throw new HttpError(409, 'CONFLICT', `title conflict in batch: ${document.title}`);
+        }
+        titles.add(document.title);
       }
-      titles.add(document.title);
-    }
 
-    if (dryRun) {
-      return { snapshot: candidate.exportJSON(), changed };
-    }
-    if (!changed) {
-      return { snapshot: current.exportJSON(), changed: false };
-    }
+      return { changed, extra: { changed } };
+    }, { dryRun });
 
-    const snapshot = candidate.exportJSON();
-    save(snapshot, nextLedger ? nextLedger.exportJSON(snapshot.checksum) : null);
-    current = candidate;
-    ledger = nextLedger;
-    return { snapshot, changed: true };
+    return { snapshot, changed: extra.changed };
   }
 
   async function createDocument(req, res) {
     const bytes = await readBody(req);
     requireIfMatch(req);
     const document = validateDocument(parseJson(decodeJsonBody(bytes)));
-    const snapshot = commit((candidate, nextLedger) => {
+    const snapshot = commitChange((candidate, nextLedger) => {
       if (candidate.get(document.id)) {
         throw new HttpError(409, 'CONFLICT', `document already exists: ${document.id}`);
       }
       assertTitleFree(candidate, document.title);
       candidate.add(document);
       if (nextLedger) nextLedger.record(document.id, 'create', candidate.get(document.id));
-    });
+    }).snapshot;
     sendJson(res, 201, snapshot, `"${snapshot.checksum}"`);
   }
 
@@ -474,17 +483,17 @@ export function createDocumentServer({ workspace, save, history = null }) {
       throw new HttpError(404, 'NOT_FOUND', `document not found: ${id}`);
     }
     const before = current.get(id);
-    const snapshot = commit((candidate, nextLedger) => {
+    const snapshot = commitChange((candidate, nextLedger) => {
       candidate.remove(id);
       assertTitleFree(candidate, document.title);
       candidate.add(document);
       const stored = candidate.get(id);
       // A replace whose normalized content is identical succeeds without
       // consuming a revision or touching the files.
-      if (sameDocument(before, stored)) return false;
+      if (sameDocument(before, stored)) return { changed: false };
       if (nextLedger) nextLedger.record(id, 'replace', stored);
-      return true;
-    });
+      return { changed: true };
+    }).snapshot;
     sendJson(res, 200, snapshot, `"${snapshot.checksum}"`);
   }
 
@@ -493,10 +502,10 @@ export function createDocumentServer({ workspace, save, history = null }) {
     if (!current.get(id)) {
       throw new HttpError(404, 'NOT_FOUND', `document not found: ${id}`);
     }
-    const snapshot = commit((candidate, nextLedger) => {
+    const snapshot = commitChange((candidate, nextLedger) => {
       candidate.remove(id);
       if (nextLedger) nextLedger.record(id, 'delete', null);
-    });
+    }).snapshot;
     sendJson(res, 200, snapshot, `"${snapshot.checksum}"`);
   }
 
@@ -534,16 +543,16 @@ export function createDocumentServer({ workspace, save, history = null }) {
       throw new HttpError(400, 'INVALID_REVISION', `revision ${data.revision} of document ${id} is a delete and cannot be restored`);
     }
     const before = current.get(id);
-    const snapshot = commit((candidate, nextLedger) => {
+    const snapshot = commitChange((candidate, nextLedger) => {
       candidate.remove(id);
       assertTitleFree(candidate, target.document.title);
       candidate.add(target.document);
       const stored = candidate.get(id);
       // Restoring the already-current content succeeds without a new record.
-      if (before && sameDocument(before, stored)) return false;
+      if (before && sameDocument(before, stored)) return { changed: false };
       nextLedger.record(id, 'restore', stored);
-      return true;
-    });
+      return { changed: true };
+    }).snapshot;
     sendJson(res, 200, snapshot, `"${snapshot.checksum}"`);
   }
 
@@ -563,9 +572,10 @@ export function createDocumentServer({ workspace, save, history = null }) {
   // Applies the tag rules to the pre-rewrite tag set of every document. Each
   // original tag is looked up once, so a rule result is never itself rewritten
   // (a→b then b→c moves the original `a` straight to `b`) and swaps resolve
-  // because `to` names are carried independently of the source keys. Returns
-  // `{ snapshot, changedIds }` without persisting when `dryRun` is true or the
-  // rewrite leaves the tag set unchanged.
+  // because `to` names are carried independently of the source keys. The
+  // shared commit rule handles previews and the unchanged case: only docs
+  // whose tags actually change are reported in `changedIds` (code-point
+  // sorted) and receive a ledger record.
   function commitTagRewrite(rules, dryRun) {
     const mapping = new Map(rules.map((rule) => [rule.from, rule.to]));
 
@@ -578,62 +588,47 @@ export function createDocumentServer({ workspace, save, history = null }) {
       if (!used.has(from)) throw new HttpError(404, 'TAG_NOT_FOUND', `tag not in use: ${from}`);
     }
 
-    const candidate = new Workspace();
-    for (const document of current.list()) candidate.add(document);
-    const nextLedger = ledger ? ledger.clone() : null;
-
-    const changedIds = [];
-    for (const document of current.list()) {
-      if (!document.tags.some((tag) => mapping.has(tag))) continue;
-      // A null target removes the tag; mapped results are emitted as-is
-      // without a second lookup, so new names are never chained further.
-      const nextTags = normalizeTags(
-        document.tags.flatMap((tag) => {
-          if (!mapping.has(tag)) return [tag];
-          const target = mapping.get(tag);
-          return target === null ? [] : [target];
-        }),
-      );
-      if (sameTags(document.tags, nextTags)) continue;
-      const updated = { id: document.id, title: document.title, body: document.body, tags: nextTags };
-      candidate.remove(document.id);
-      candidate.add(updated);
-      if (nextLedger) nextLedger.record(document.id, 'replace', candidate.get(document.id));
-      changedIds.push(document.id);
-    }
-    changedIds.sort(compareCodePoints);
-
-    if (dryRun) {
-      return { snapshot: candidate.exportJSON(), changedIds };
-    }
-    if (changedIds.length === 0) {
-      // Tag set unchanged: report the current snapshot and no file/version work.
-      return { snapshot: current.exportJSON(), changedIds: [] };
-    }
-
-    const snapshot = candidate.exportJSON();
-    save(snapshot, nextLedger ? nextLedger.exportJSON(snapshot.checksum) : null);
-    current = candidate;
-    ledger = nextLedger;
-    return { snapshot, changedIds };
+    return commitChange((candidate, nextLedger) => {
+      const changedIds = [];
+      for (const document of current.list()) {
+        if (!document.tags.some((tag) => mapping.has(tag))) continue;
+        // A null target removes the tag; mapped results are emitted as-is
+        // without a second lookup, so new names are never chained further.
+        const nextTags = normalizeTags(
+          document.tags.flatMap((tag) => {
+            if (!mapping.has(tag)) return [tag];
+            const target = mapping.get(tag);
+            return target === null ? [] : [target];
+          }),
+        );
+        if (sameTags(document.tags, nextTags)) continue;
+        const updated = { id: document.id, title: document.title, body: document.body, tags: nextTags };
+        candidate.remove(document.id);
+        candidate.add(updated);
+        if (nextLedger) nextLedger.record(document.id, 'replace', candidate.get(document.id));
+        changedIds.push(document.id);
+      }
+      changedIds.sort(compareCodePoints);
+      return { changed: changedIds.length > 0, extra: { changedIds } };
+    }, { dryRun });
   }
 
   async function rewriteTags(req, res) {
     const bytes = await readBody(req);
     requireIfMatch(req);
     const { rules, dryRun } = validateTagRules(parseJson(decodeJsonBody(bytes)));
-    const { snapshot, changedIds } = commitTagRewrite(rules, dryRun);
-    sendJson(res, 200, { snapshot, changedIds }, `"${snapshot.checksum}"`);
+    const { snapshot, extra } = commitTagRewrite(rules, dryRun);
+    sendJson(res, 200, { snapshot, changedIds: extra.changedIds }, `"${snapshot.checksum}"`);
   }
 
   // Merges an offline-edited incoming snapshot back against its base, keeping
   // non-conflicting online edits. The merge is computed against the current
-  // live state; field/add/delete/title conflicts reject the whole request.
-  // Each actually-changed document appends one ledger record (create for new
-  // or reappearing ids, replace for edits, delete for removals), continuing
-  // that id's revision sequence. Returns `{ snapshot, changedIds }` without
-  // persisting when `dryRun` is true or the merge leaves the content equal to
-  // the current state.
+  // live state; field/add/delete/title conflicts reject the whole request
+  // before any projection is built. Each actually-changed document appends one
+  // ledger record (create for new or reappearing ids, replace for edits,
+  // delete for removals), continuing that id's revision sequence. The shared
+  // commit rule handles previews, the unchanged merge (no file, no revision),
+  // save-before-swap, and rollback on a failed save.
   function commitReconcile(base, incoming, dryRun) {
     const currentSnapshot = current.exportJSON();
     const result = reconcileSnapshots(currentSnapshot, base, incoming);
@@ -646,30 +641,27 @@ export function createDocumentServer({ workspace, save, history = null }) {
       return { snapshot: currentSnapshot, changedIds: [] };
     }
 
-    const candidate = new Workspace();
-    for (const document of result.snapshot.documents) candidate.add(document);
-    const nextLedger = ledger ? ledger.clone() : null;
-    for (const id of result.changedIds) {
-      if (!nextLedger) break;
-      const stored = candidate.get(id);
-      if (stored) {
-        // A previously-deleted id that reappears continues its chain with a
-        // create; a changed live document gets a replace.
-        const action = current.get(id) ? 'replace' : 'create';
-        nextLedger.record(id, action, stored);
-      } else {
-        nextLedger.record(id, 'delete', null);
+    const { snapshot } = commitChange((candidate, nextLedger) => {
+      // The merge result is the complete final document set (deletions are
+      // simply absent), so install it wholesale over the copied state.
+      for (const id of candidate.list().map((document) => document.id)) candidate.remove(id);
+      for (const document of result.snapshot.documents) candidate.add(document);
+      if (nextLedger) {
+        for (const id of result.changedIds) {
+          const stored = candidate.get(id);
+          if (stored) {
+            // A previously-deleted id that reappears continues its chain with a
+            // create; a changed live document gets a replace.
+            const action = current.get(id) ? 'replace' : 'create';
+            nextLedger.record(id, action, stored);
+          } else {
+            nextLedger.record(id, 'delete', null);
+          }
+        }
       }
-    }
+      return { changed: true };
+    }, { dryRun });
 
-    if (dryRun) {
-      return { snapshot: candidate.exportJSON(), changedIds: result.changedIds };
-    }
-
-    const snapshot = candidate.exportJSON();
-    save(snapshot, nextLedger ? nextLedger.exportJSON(snapshot.checksum) : null);
-    current = candidate;
-    ledger = nextLedger;
     return { snapshot, changedIds: result.changedIds };
   }
 
