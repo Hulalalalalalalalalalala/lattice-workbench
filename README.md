@@ -231,6 +231,17 @@ exactly one JSON line with the actual address, e.g.
   case-sensitive), missing documents `404`, a path/body id mismatch or invalid
   JSON/document fields `400`, and bodies over 1 MiB `413`. Every failure
   response carries a stable `code` and never changes the stored content.
+- Write bodies must be valid UTF-8. A lone continuation byte, a truncated or
+  overlong multibyte sequence, an encoded surrogate code point, or bytes
+  beyond the Unicode range answers `400`/`INVALID_JSON` rather than being
+  silently replaced with U+FFFD; a U+FFFD that was itself encoded validly is
+  ordinary text and kept. JSON escapes keep their usual string semantics. The
+  1 MiB limit is measured on the raw bytes, so an oversized body that also
+  contains illegal bytes still answers `413`/`PAYLOAD_TOO_LARGE`, and a
+  multibyte character split across transport chunks decodes identically to the
+  same body sent in one frame. The rule applies to every write route,
+  including batch, tag rewrite, reconcile, and restore (whose other body
+  errors stay `INVALID_REVISION`), and to dry-run previews.
 
 #### Tag organization
 

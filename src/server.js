@@ -4,6 +4,10 @@ import { sameDocument } from './history.js';
 import { reconcileSnapshots } from './reconcile.js';
 
 const MAX_BODY_BYTES = 1024 * 1024;
+// Bodies must be valid UTF-8: a fatal decode rejects lone continuation
+// bytes, truncated or overlong multibyte sequences, surrogate code points,
+// and out-of-range sequences instead of letting them surface as U+FFFD.
+const fatalDecoder = new TextDecoder('utf-8', { fatal: true });
 const ETAG_PATTERN = /^"[0-9a-f]{64}"$/u;
 const ID_PATTERN = /^[a-z0-9][a-z0-9._-]*$/u;
 const DOCUMENT_FIELDS = new Set(['id', 'title', 'body', 'tags']);
@@ -42,6 +46,10 @@ function sendJson(res, status, payload, etag) {
   res.end(JSON.stringify(payload));
 }
 
+// Reads and size-limits the raw request bytes. The byte count, not the
+// decoded character count, is compared against the 1 MiB limit. A multibyte
+// character split across transport chunks is reassembled by Buffer.concat, so
+// the framing never affects later decoding.
 async function readBody(req) {
   const declared = Number(req.headers['content-length']);
   if (Number.isFinite(declared) && declared > MAX_BODY_BYTES) {
@@ -57,7 +65,21 @@ async function readBody(req) {
     }
     chunks.push(chunk);
   }
-  return Buffer.concat(chunks).toString('utf8');
+  return Buffer.concat(chunks);
+}
+
+// Strictly decodes a request body as UTF-8: a lone continuation byte, a
+// truncated or overlong multibyte sequence, an encoded surrogate code point,
+// or bytes beyond the Unicode range are rejected instead of silently becoming
+// U+FFFD in a stored document. (A U+FFFD that was itself encoded validly is
+// ordinary text and decodes fine.) JSON escapes such as "\uD800" are untouched
+// by this layer and keep their existing string semantics.
+function decodeJsonBody(bytes) {
+  try {
+    return fatalDecoder.decode(bytes);
+  } catch {
+    throw new HttpError(400, 'INVALID_JSON', 'request body is not valid UTF-8');
+  }
 }
 
 function parseJson(text) {
@@ -427,9 +449,9 @@ export function createDocumentServer({ workspace, save, history = null }) {
   }
 
   async function createDocument(req, res) {
-    const text = await readBody(req);
+    const bytes = await readBody(req);
     requireIfMatch(req);
-    const document = validateDocument(parseJson(text));
+    const document = validateDocument(parseJson(decodeJsonBody(bytes)));
     const snapshot = commit((candidate, nextLedger) => {
       if (candidate.get(document.id)) {
         throw new HttpError(409, 'CONFLICT', `document already exists: ${document.id}`);
@@ -442,9 +464,9 @@ export function createDocumentServer({ workspace, save, history = null }) {
   }
 
   async function replaceDocument(req, res, id) {
-    const text = await readBody(req);
+    const bytes = await readBody(req);
     requireIfMatch(req);
-    const document = validateDocument(parseJson(text));
+    const document = validateDocument(parseJson(decodeJsonBody(bytes)));
     if (document.id !== id) {
       throw new HttpError(400, 'ID_MISMATCH', `path id ${id} does not match body id ${document.id}`);
     }
@@ -487,8 +509,12 @@ export function createDocumentServer({ workspace, save, history = null }) {
 
   async function restoreDocument(req, res, id) {
     if (!ledger) throw new HttpError(404, 'NOT_FOUND', `no route for POST /documents/${id}/restore`);
-    const text = await readBody(req);
+    const bytes = await readBody(req);
     requireIfMatch(req);
+    // Bad UTF-8 is an INVALID_JSON transport-level failure; only once the
+    // bytes decode do the restore-specific parse/shape rules apply, which
+    // keep reporting INVALID_REVISION as before.
+    const text = decodeJsonBody(bytes);
     let data;
     try {
       data = JSON.parse(text);
@@ -522,9 +548,9 @@ export function createDocumentServer({ workspace, save, history = null }) {
   }
 
   async function batch(req, res) {
-    const text = await readBody(req);
+    const bytes = await readBody(req);
     requireIfMatch(req);
-    const data = parseJson(text);
+    const data = parseJson(decodeJsonBody(bytes));
     const { operations, dryRun } = validateBatchRequest(data);
     const { snapshot } = commitBatch(operations, dryRun);
     sendJson(res, 200, snapshot, `"${snapshot.checksum}"`);
@@ -593,9 +619,9 @@ export function createDocumentServer({ workspace, save, history = null }) {
   }
 
   async function rewriteTags(req, res) {
-    const text = await readBody(req);
+    const bytes = await readBody(req);
     requireIfMatch(req);
-    const { rules, dryRun } = validateTagRules(parseJson(text));
+    const { rules, dryRun } = validateTagRules(parseJson(decodeJsonBody(bytes)));
     const { snapshot, changedIds } = commitTagRewrite(rules, dryRun);
     sendJson(res, 200, { snapshot, changedIds }, `"${snapshot.checksum}"`);
   }
@@ -648,9 +674,9 @@ export function createDocumentServer({ workspace, save, history = null }) {
   }
 
   async function reconcile(req, res) {
-    const text = await readBody(req);
+    const bytes = await readBody(req);
     requireIfMatch(req);
-    const { base, incoming, dryRun } = validateReconcileRequest(parseJson(text));
+    const { base, incoming, dryRun } = validateReconcileRequest(parseJson(decodeJsonBody(bytes)));
     try {
       const snapshot = commitReconcile(base, incoming, dryRun).snapshot;
       sendJson(res, 200, snapshot, `"${snapshot.checksum}"`);
