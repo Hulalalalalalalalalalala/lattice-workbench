@@ -215,7 +215,8 @@ exactly one JSON line with the actual address, e.g.
 - `GET /documents` lists documents, `GET /documents/:id` reads one,
   `POST /documents` adds a document, `PUT /documents/:id` replaces one
   wholesale (path and body ids must match), `DELETE /documents/:id` removes
-  one. `GET /search?q=...` and `GET /documents/:id/links` use the existing
+  one, and `POST /batch` applies several operations atomically (see below).
+  `GET /search?q=...` and `GET /documents/:id/links` use the existing
   search and link semantics. Bodies are stored verbatim and tags are
   normalized as usual.
 - Read responses carry a double-quoted `ETag` holding the current workspace
@@ -242,6 +243,117 @@ exactly one JSON line with the actual address, e.g.
   same body sent in one frame. The rule applies to every write route,
   including batch, tag rewrite, reconcile, and restore (whose other body
   errors stay `INVALID_REVISION`), and to dry-run previews.
+
+#### Batch operations
+
+`POST /batch` applies several document operations as one atomic commit. The
+body is exactly `{ "operations": [...], "dryRun"? }`:
+
+- `operations` holds 1 to 100 entries, each targeting a distinct document
+  id: `{ "type": "create", "document" }`, `{ "type": "replace", "document" }`,
+  `{ "type": "delete", "id" }`, or `{ "type": "restore", "id", "revision" }`.
+  A `replace` is wholesale, exactly like `PUT /documents/:id`: the supplied
+  document fully replaces the stored one, so `body` and `tags` must carry
+  the values you want to keep.
+- `dryRun` is an optional boolean (default `false`); when `true` the
+  projected result is returned without modifying state.
+- Existence and restore-version checks run against the pre-commit state,
+  while title uniqueness is judged on the document set after the whole batch —
+  so the result never depends on the order of the operations. As elsewhere,
+  titles are compared after trimming surrounding whitespace and stay
+  case-sensitive.
+- `If-Match` is required as for every write, previews included. Success
+  answers `200` with the result snapshot and its `ETag`. Structural problems
+  answer `400`/`INVALID_BATCH`; content problems follow the single-document
+  codes. With history enabled, each actually-changed document appends
+  exactly one record of the matching action; previews and failures append
+  nothing, write no file, and leave the saved content untouched.
+
+##### Example: swapping two titles
+
+Suppose the workspace currently holds two documents, and `GET /documents`
+answers `200` with:
+
+```json
+{
+  "version": 1,
+  "documents": [
+    { "id": "alpha", "title": "Alpha", "body": "First note. See [[beta]].", "tags": ["intro"] },
+    { "id": "beta", "title": "Beta", "body": "Second note, linking back to [[alpha]].", "tags": ["reference"] }
+  ],
+  "checksum": "a1b2…"
+}
+```
+
+The response carries `ETag: "a1b2…"` (the current checksum). The goal is to
+exchange the titles — `alpha` becomes `Beta`, `beta` becomes `Alpha` —
+while each document keeps its id, body, and tags.
+
+First preview the swap. Send the current `ETag` as `If-Match` together with
+`"dryRun": true`, using two `replace` operations whose documents carry the
+new titles and the bodies and tags to preserve:
+
+```http
+POST /batch
+If-Match: "a1b2…"
+
+{
+  "operations": [
+    { "type": "replace", "document": { "id": "alpha", "title": "Beta", "body": "First note. See [[beta]].", "tags": ["intro"] } },
+    { "type": "replace", "document": { "id": "beta", "title": "Alpha", "body": "Second note, linking back to [[alpha]].", "tags": ["reference"] } }
+  ],
+  "dryRun": true
+}
+```
+
+This answers `200` with the projected result snapshot (titles swapped,
+checksum `d4e5…`) and `ETag: "d4e5…"`, but a fresh `GET /documents` still
+shows `Alpha`/`Beta` with `ETag: "a1b2…"`: nothing was saved. The preview's
+`ETag` belongs to the projected result, not to the currently saved content,
+so it cannot be used as `If-Match` for a write.
+
+The swap succeeds because duplicate titles are judged on the document set
+after the whole batch: once both replaces are applied the titles are `Beta`
+and `Alpha`, which are unique, and listing the two operations in the
+opposite order gives the same result. Splitting the same swap into two
+single `PUT /documents/:id` requests fails at the very first step — putting
+title `Beta` on `alpha` collides with the still-existing `beta` document
+and answers `409`/`CONFLICT`, because a single replace checks the title
+against the current set.
+
+To commit, re-read the documents, confirm the fields to keep, and take the
+`ETag` of that read (still `"a1b2…"` if nothing else has written). Resend
+the same request without `dryRun` (or with `"dryRun": false`):
+
+```http
+POST /batch
+If-Match: "a1b2…"
+
+{
+  "operations": [
+    { "type": "replace", "document": { "id": "alpha", "title": "Beta", "body": "First note. See [[beta]].", "tags": ["intro"] } },
+    { "type": "replace", "document": { "id": "beta", "title": "Alpha", "body": "Second note, linking back to [[alpha]].", "tags": ["reference"] } }
+  ]
+}
+```
+
+This answers `200`: both titles are exchanged together, and the response is
+the full result snapshot with an `ETag` matching its checksum — the same
+`d4e5…` projection the preview showed.
+
+Two failure conditions directly affect the swap:
+
+- `409`/`CONFLICT`: a title still duplicates another document's after the
+  whole batch (for example a third document is already titled `Beta`). The
+  batch is rejected whole and both documents keep their original titles.
+- `412`/`PRECONDITION_FAILED`: the `If-Match` checksum is stale because
+  another write committed meanwhile. Re-read the documents, confirm the
+  fields to keep, and decide whether to submit again with the fresh `ETag`.
+
+With `--history` enabled, the successful swap appends exactly one `replace`
+record to each of the two documents; the preview and any failed request
+append none. A preview never writes the snapshot file, and a failed batch
+never changes the saved content.
 
 #### Tag organization
 
