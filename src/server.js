@@ -405,13 +405,13 @@ export function createDocumentServer({ workspace, save, history = null }) {
       let changed = false;
       for (const op of operations) {
         if (op.type === 'create') {
-          candidate.add(op.document);
+          candidate.put(op.document);
           if (nextLedger) nextLedger.record(op.document.id, 'create', candidate.get(op.document.id));
           changed = true;
         } else if (op.type === 'replace') {
           const before = current.get(op.document.id);
           candidate.remove(op.document.id);
-          candidate.add(op.document);
+          candidate.put(op.document);
           const stored = candidate.get(op.document.id);
           if (!sameDocument(before, stored)) {
             if (nextLedger) nextLedger.record(op.document.id, 'replace', stored);
@@ -425,7 +425,7 @@ export function createDocumentServer({ workspace, save, history = null }) {
           const before = current.get(op.id);
           const target = ledger.entry(op.id, op.revision);
           candidate.remove(op.id);
-          candidate.add(target.document);
+          candidate.put(target.document);
           const stored = candidate.get(op.id);
           if (!before || !sameDocument(before, stored)) {
             nextLedger.record(op.id, 'restore', stored);

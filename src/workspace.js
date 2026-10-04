@@ -309,6 +309,24 @@ export class Workspace {
   add(input) {
     assertDocument(input);
     if (this.#documents.has(input.id)) throw new Error(`document already exists: ${input.id}`);
+    // Titles are unique across the live set, compared case-sensitively after
+    // trimming surrounding whitespace — the same rule snapshot import
+    // enforces, so anything added here can always be exported and re-imported.
+    const title = input.title.trim();
+    for (const existing of this.#documents.values()) {
+      if (existing.title === title) throw new Error(`title already in use: ${title}`);
+    }
+    return this.put(input);
+  }
+
+  // Inserts a validated, normalized document without the title-uniqueness
+  // check. The batch commit uses this because its intermediate states may
+  // hold a title twice (a title swap, or a create ordered before the delete
+  // that frees the title); it validates the final projected set itself
+  // before committing. Direct additions must go through add().
+  put(input) {
+    assertDocument(input);
+    if (this.#documents.has(input.id)) throw new Error(`document already exists: ${input.id}`);
     const document = Object.freeze({ id: input.id, title: input.title.trim(), body: input.body, tags: normalizeTags(input.tags ?? []) });
     this.#documents.set(document.id, document);
     return structuredClone(document);
