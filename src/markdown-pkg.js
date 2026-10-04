@@ -179,7 +179,11 @@ function realLocation(target) {
 
 function isInside(candidate, directory) {
   const relative = path.relative(directory, candidate);
-  return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
+  if (relative === '') return true;
+  if (path.isAbsolute(relative)) return false;
+  // Only a first path component of exactly '..' leaves the directory. A name
+  // that merely begins with two dots ('..notes', '..notes/x/y') stays inside.
+  return relative.split(path.sep)[0] !== '..';
 }
 
 // ---- File-system orchestration --------------------------------------------
