@@ -412,6 +412,140 @@ test('snapshots merely named like scratch locations export normally', () => {
   assert.ok(fs.existsSync(path.join(cwd, 'pkg.old.tmp.maybe.json')));
 });
 
+test('export refuses a source nested under a dot-dot name inside the output or scratch locations', () => {
+  const snapshotTree = (root) => {
+    const walk = (directory) => {
+      const entries = {};
+      for (const name of fs.readdirSync(directory).sort()) {
+        const full = path.join(directory, name);
+        const stats = fs.lstatSync(full);
+        if (stats.isSymbolicLink()) entries[name] = `<symlink:${fs.readlinkSync(full)}>`;
+        else if (stats.isDirectory()) entries[name] = walk(full);
+        else entries[name] = fs.readFileSync(full);
+      }
+      return entries;
+    };
+    return walk(root);
+  };
+
+  const variants = [
+    // Valid snapshot placed in <output>/..notes, then the output is the target.
+    (dir) => {
+      fs.mkdirSync(path.join(dir, 'pkg', '..notes'), { recursive: true });
+      return { source: path.join(dir, 'pkg', '..notes', 'snap.json'), output: path.join(dir, 'pkg') };
+    },
+    // Nested deeper than the dot-dot-named component.
+    (dir) => {
+      fs.mkdirSync(path.join(dir, 'pkg', '..notes', 'a', 'b'), { recursive: true });
+      return { source: path.join(dir, 'pkg', '..notes', 'a', 'b', 's.json'), output: path.join(dir, 'pkg') };
+    },
+    // Leftover staging directory holding the source under a dot-dot name.
+    (dir) => {
+      const stage = path.join(dir, 'pkg.export.tmp');
+      fs.mkdirSync(path.join(stage, '..notes'), { recursive: true });
+      return { source: path.join(stage, '..notes', 'snap.json'), output: path.join(dir, 'pkg') };
+    },
+    // Leftover backup directory holding the source under a dot-dot name.
+    (dir) => {
+      const backup = path.join(dir, 'pkg.old.tmp');
+      fs.mkdirSync(path.join(backup, '..notes', 'nested'), { recursive: true });
+      return { source: path.join(backup, '..notes', 'nested', 'snap.json'), output: path.join(dir, 'pkg') };
+    },
+  ];
+  for (let index = 0; index < variants.length; index += 1) {
+    const cwd = tempDir();
+    writeSnapshot(path.join(cwd, 'snap.json'), workspaceWith([{ id: 'a', title: 'A', body: 'b', tags: [] }]));
+    // A pre-existing target with content the rejection must leave in place.
+    fs.mkdirSync(path.join(cwd, 'pkg'), { recursive: true });
+    fs.writeFileSync(path.join(cwd, 'pkg', 'untouched'), 'yes');
+
+    const { source, output } = variants[index](cwd);
+    fs.writeFileSync(source, fs.readFileSync(path.join(cwd, 'snap.json')));
+    const before = snapshotTree(cwd);
+    assert.throws(
+      () => exportMarkdown(source, output),
+      (error) => error.code === 'INVALID_OPTIONS',
+      `variant ${index}`,
+    );
+    // No path under cwd was deleted, moved, created, or rewritten.
+    assert.deepEqual(snapshotTree(cwd), before, `variant ${index}`);
+    assert.ok(fs.existsSync(source), `variant ${index}`);
+  }
+});
+
+test('a dot-dot named directory overlapping the output is detected through a symlinked parent', () => {
+  const cwd = tempDir();
+  const workspace = workspaceWith([{ id: 'a', title: 'A', body: 'b', tags: [] }]);
+  const realOut = path.join(cwd, 'realout');
+  fs.mkdirSync(path.join(realOut, '..notes', 'deep'), { recursive: true });
+  writeSnapshot(path.join(realOut, '..notes', 'deep', 's.json'), workspace);
+  fs.symlinkSync('realout', path.join(cwd, 'alias'));
+
+  // Source reached through the aliased parent, output given by its real path.
+  assert.throws(
+    () => exportMarkdown(path.join(cwd, 'alias', '..notes', 'deep', 's.json'), realOut),
+    (error) => error.code === 'INVALID_OPTIONS',
+  );
+  // Output reached through the alias, source given by its real path.
+  assert.throws(
+    () => exportMarkdown(path.join(realOut, '..notes', 'deep', 's.json'), path.join(cwd, 'alias')),
+    (error) => error.code === 'INVALID_OPTIONS',
+  );
+  assert.deepEqual(
+    fs.readFileSync(path.join(realOut, '..notes', 'deep', 's.json'), 'utf8'),
+    `${JSON.stringify(workspace.exportJSON())}\n`,
+  );
+  assert.ok(!fs.existsSync(path.join(realOut, 'a.md')));
+});
+
+test('path conflict inside a dot-dot name is reported before an unreadable or invalid source', () => {
+  const cwd = tempDir();
+  const target = path.join(cwd, 'pkg');
+
+  // Invalid snapshot content: the path conflict still wins.
+  fs.mkdirSync(path.join(target, '..notes'), { recursive: true });
+  fs.writeFileSync(path.join(target, '..notes', 'bad.json'), '{ not valid json');
+  assert.throws(
+    () => exportMarkdown(path.join(target, '..notes', 'bad.json'), target),
+    (error) => error.code === 'INVALID_OPTIONS',
+  );
+
+  // A source that does not even exist: the path conflict still wins and the
+  // missing output location is never created.
+  assert.throws(
+    () => exportMarkdown(path.join(target, '..notes', 'missing.json'), target),
+    (error) => error.code === 'INVALID_OPTIONS',
+  );
+  assert.deepEqual(fs.readdirSync(target), ['..notes']);
+  assert.ok(!fs.existsSync(path.join(cwd, 'pkg.export.tmp')));
+  assert.ok(!fs.existsSync(path.join(cwd, 'pkg.old.tmp')));
+});
+
+test('a source in an adjacent dot-dot named directory exports normally and is retained', () => {
+  const cwd = tempDir();
+  const workspace = workspaceWith([{ id: 'a', title: 'A', body: 'b', tags: [] }]);
+
+  // Sibling ..notes directory next to the output: no overlap, exports fine.
+  fs.mkdirSync(path.join(cwd, '..notes'), { recursive: true });
+  const adjacent = path.join(cwd, '..notes', 'snap.json');
+  writeSnapshot(adjacent, workspace);
+  exportMarkdown(adjacent, path.join(cwd, 'pkg'));
+  assert.deepEqual(fs.readdirSync(path.join(cwd, 'pkg')).sort(), ['a.md', 'manifest.json']);
+  assert.deepEqual(
+    fs.readFileSync(adjacent, 'utf8'),
+    `${JSON.stringify(workspace.exportJSON())}\n`,
+  );
+
+  // A dot-dot name nested inside a merely similarly named sibling directory.
+  const second = path.join(cwd, 'scratch');
+  fs.mkdirSync(path.join(second, '..notes'), { recursive: true });
+  const other = path.join(second, '..notes', 'snap.json');
+  writeSnapshot(other, workspace);
+  exportMarkdown(other, path.join(cwd, 'pkg2'));
+  assert.deepEqual(fs.readdirSync(path.join(cwd, 'pkg2')).sort(), ['a.md', 'manifest.json']);
+  assert.ok(fs.existsSync(other));
+});
+
 test('CLI export-md fails with status 1 when the source sits in the staging directory', () => {
   const cwd = tempDir();
   writeSnapshot(path.join(cwd, 'snap.json'), workspaceWith([{ id: 'a', title: 'A', body: 'b', tags: [] }]));
@@ -431,6 +565,32 @@ test('CLI export-md fails with status 1 when the source sits in the staging dire
   assert.equal(JSON.parse(lines[0]).code, 'INVALID_OPTIONS');
   assert.deepEqual(fs.readFileSync(source), fs.readFileSync(path.join(cwd, 'snap.json')));
   assert.ok(!fs.existsSync(path.join(cwd, 'pkg')));
+});
+
+test('CLI export-md rejects a source in <output>/..notes with one INVALID_OPTIONS line', () => {
+  const cwd = tempDir();
+  const workspace = workspaceWith([{ id: 'a', title: 'A', body: 'b', tags: [] }]);
+  fs.mkdirSync(path.join(cwd, 'pkg', '..notes'), { recursive: true });
+  const source = path.join(cwd, 'pkg', '..notes', 's.json');
+  writeSnapshot(source, workspace);
+
+  const { status, stdout, stderr } = runCli(
+    ['export-md', path.join('pkg', '..notes', 's.json'), 'pkg'],
+    cwd,
+  );
+  assert.equal(status, 1);
+  assert.equal(stdout, '');
+  const lines = stderr.split('\n');
+  assert.equal(lines.length, 2);
+  assert.equal(lines[1], '');
+  assert.equal(JSON.parse(lines[0]).code, 'INVALID_OPTIONS');
+  assert.deepEqual(
+    fs.readFileSync(source, 'utf8'),
+    `${JSON.stringify(workspace.exportJSON())}\n`,
+  );
+  assert.deepEqual(fs.readdirSync(path.join(cwd, 'pkg')), ['..notes']);
+  assert.ok(!fs.existsSync(path.join(cwd, 'pkg.export.tmp')));
+  assert.ok(!fs.existsSync(path.join(cwd, 'pkg.old.tmp')));
 });
 
 test('path options are compared by real location', () => {

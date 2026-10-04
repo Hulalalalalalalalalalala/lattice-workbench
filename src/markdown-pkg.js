@@ -179,7 +179,12 @@ function realLocation(target) {
 
 function isInside(candidate, directory) {
   const relative = path.relative(directory, candidate);
-  return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
+  if (relative === '') return true;
+  if (path.isAbsolute(relative)) return false;
+  // Only a real parent-traversal segment escapes the directory. A component
+  // that merely starts with two dots (e.g. "..notes") is an ordinary name and
+  // stays inside, at any nesting depth.
+  return relative.split(path.sep).every((segment) => segment !== '..');
 }
 
 // ---- File-system orchestration --------------------------------------------
