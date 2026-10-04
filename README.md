@@ -617,7 +617,11 @@ exactly as before and the history routes are absent.
   leaves in-memory state, query results, history, and both files as they were.
 - Startup errors exit `1` after writing exactly one JSON line containing a
   `code` to standard error, leaving the files untouched:
-  - `INVALID_OPTIONS`: the snapshot and history paths resolve to the same file.
+  - `INVALID_OPTIONS`: the snapshot path resolves to the same location as the
+    history file or its commit backup (`<history>.bak`). Locations are
+    compared after resolving `.`/`..` segments and symlinks, so aliases of
+    either location — including ones whose files do not exist yet — are
+    rejected before any content is loaded.
   - `IO_ERROR`: an existing history file cannot be read.
   - `INVALID_HISTORY`: the history is corrupt, or it cannot be reconciled to a
     single consistent state with the snapshot.

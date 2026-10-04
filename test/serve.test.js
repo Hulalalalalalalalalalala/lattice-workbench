@@ -795,6 +795,104 @@ test('serve rejects identical snapshot/history paths and bad history files', asy
   assert.equal(fs.readFileSync(corrupt, 'utf8'), '{broken json');
 });
 
+test('serve rejects a snapshot aliasing the history file or its backup before loading content', async () => {
+  const cwd = tempDir();
+  const realDir = path.join(cwd, 'real');
+  fs.mkdirSync(realDir);
+  const history = path.join(realDir, 'history.json');
+  const backup = `${history}.bak`;
+
+  // Both inputs are corrupt: the path conflict must still be reported as
+  // INVALID_OPTIONS, never INVALID_SNAPSHOT or INVALID_HISTORY.
+  fs.writeFileSync(history, '{broken json');
+  fs.writeFileSync(backup, 'existing backup');
+
+  const linkDir = path.join(cwd, 'linked');
+  fs.symlinkSync(realDir, linkDir, 'dir');
+  const snapshotLink = path.join(cwd, 'snap-link.json');
+  fs.symlinkSync(history, snapshotLink);
+
+  const conflicting = [
+    // The history file itself, spelled different ways.
+    history,
+    path.join(cwd, 'real', '.', 'history.json'),
+    path.join(cwd, 'linked', 'history.json'), // via a symlinked directory
+    snapshotLink, // via a file symlink
+    path.join('real', '..', 'real', 'history.json'), // relative with ".."
+    // The history backup location, spelled different ways.
+    backup,
+    path.join(cwd, 'linked', 'history.json.bak'),
+    path.join('real', 'history.json.bak'), // relative spelling
+  ];
+  for (const snapshot of conflicting) {
+    const { status, stdout, stderr } = await startServerFailure(
+      [snapshot, '--history', history, '--port', '0'], { cwd },
+    );
+    assert.equal(status, 1, snapshot);
+    assert.equal(stdout, '', snapshot);
+    const lines = stderr.split('\n');
+    assert.equal(lines.length, 2, snapshot);
+    assert.equal(JSON.parse(lines[0]).code, 'INVALID_OPTIONS', snapshot);
+    // Nothing was created, overwritten, moved, or deleted.
+    assert.equal(fs.readFileSync(history, 'utf8'), '{broken json');
+    assert.equal(fs.readFileSync(backup, 'utf8'), 'existing backup');
+  }
+});
+
+test('serve rejects snapshot/history aliases whose files do not exist yet', async () => {
+  const cwd = tempDir();
+  const realDir = path.join(cwd, 'real');
+  fs.mkdirSync(realDir);
+  const linkDir = path.join(cwd, 'linked');
+  fs.symlinkSync(realDir, linkDir, 'dir');
+
+  // Neither file exists: the symlinked parent directory still gives the
+  // snapshot the history backup's location.
+  const history = path.join(linkDir, 'history.json');
+  const snapshot = path.join(realDir, 'history.json.bak');
+  const failed = await startServerFailure([snapshot, '--history', history, '--port', '0']);
+  assert.equal(failed.status, 1);
+  assert.equal(failed.stdout, '');
+  assert.equal(JSON.parse(failed.stderr.trim()).code, 'INVALID_OPTIONS');
+  assert.ok(!fs.existsSync(snapshot));
+  assert.ok(!fs.existsSync(history));
+
+  // Same pair through the non-aliased directory starts normally.
+  const server = await startServer([
+    path.join(realDir, 'snap.json'), '--history', path.join(realDir, 'history.json'), '--port', '0',
+  ]);
+  await server.stop();
+});
+
+test('serve accepts independent snapshot, history, and backup locations', async () => {
+  const cwd = tempDir();
+  // The same basename in different real directories is not a conflict, and a
+  // snapshot whose name merely ends in ".bak" is not rejected wholesale.
+  const dirA = path.join(cwd, 'a');
+  const dirB = path.join(cwd, 'b');
+  fs.mkdirSync(dirA);
+  fs.mkdirSync(dirB);
+  const snapshot = path.join(dirA, 'history.json.bak');
+  const history = path.join(dirB, 'history.json');
+  const server = await startServer([snapshot, '--history', history, '--port', '0']);
+  try {
+    const empty = await request(server.url, 'GET', '/documents');
+    assert.equal(empty.status, 200);
+    const created = await request(server.url, 'POST', '/documents', {
+      body: { id: 'a', title: 'A', body: 'body', tags: [] },
+      headers: { 'if-match': empty.etag },
+    });
+    assert.equal(created.status, 201);
+    assert.ok(fs.existsSync(snapshot));
+    assert.ok(fs.existsSync(history));
+    assert.ok(!fs.existsSync(`${history}.bak`));
+    const rows = (await request(server.url, 'GET', '/documents/a/history')).body;
+    assert.deepEqual(rows.map((entry) => [entry.revision, entry.action]), [[1, 'create']]);
+  } finally {
+    await server.stop();
+  }
+});
+
 test('serve without --history keeps the original behavior and exposes no history routes', async () => {
   const cwd = tempDir();
   const server = await startServer([path.join(cwd, 'snap.json'), '--port', '0']);

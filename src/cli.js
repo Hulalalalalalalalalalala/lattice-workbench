@@ -123,6 +123,27 @@ function importMd(args) {
   process.stdout.write(`${JSON.stringify(snapshot)}\n`);
 }
 
+// Resolves a path to the location it actually names on disk, whether or not
+// the file exists yet: the deepest existing ancestor is canonicalized with
+// realpath (collapsing ".." segments and symlinked directories) and the
+// not-yet-created tail is re-appended. Relative vs absolute spellings, "."
+// and ".." segments, and symlinks in the parent directories or the final
+// file therefore compare equal when they name the same location.
+function canonicalLocation(file) {
+  const absolute = path.resolve(file);
+  let current = absolute;
+  const missing = [];
+  while (!fs.existsSync(current)) {
+    missing.push(path.basename(current));
+    current = path.dirname(current);
+  }
+  let resolved = fs.realpathSync(current);
+  for (let index = missing.length - 1; index >= 0; index -= 1) {
+    resolved = path.join(resolved, missing[index]);
+  }
+  return resolved;
+}
+
 function parsePort(value) {  if (!/^\d+$/u.test(value)) {
     throw new SnapshotError('INVALID_OPTIONS', `invalid port: ${value}`);
   }
@@ -161,8 +182,24 @@ function parseServeArgs(args) {
   if (positionals.length !== 1) {
     throw new SnapshotError('INVALID_OPTIONS', 'usage: serve <snapshot> [--port <port>] [--history <file>]');
   }
-  if (historyFile !== null && path.resolve(positionals[0]) === path.resolve(historyFile)) {
-    throw new SnapshotError('INVALID_OPTIONS', 'snapshot and history must be different files');
+  if (historyFile !== null) {
+    // The snapshot must not occupy the history file's location nor the
+    // location of its commit backup (`<history>.bak`): the backup slot is
+    // moved aside and replaced during every commit, so a snapshot living
+    // there would be relocated or deleted mid-serve. Compare canonical
+    // locations so aliases (relative spellings, "." / "..", and symlinks in
+    // the parent directories or the files themselves) are rejected too, even
+    // when the files have not been created yet. This runs before any content
+    // is loaded, so a corrupt snapshot or history still reports this
+    // configuration error first.
+    const snapshotLocation = canonicalLocation(positionals[0]);
+    if (snapshotLocation === canonicalLocation(historyFile)) {
+      throw new SnapshotError('INVALID_OPTIONS', `snapshot and history file resolve to the same location: ${historyFile}`);
+    }
+    const backupFile = `${historyFile}.bak`;
+    if (snapshotLocation === canonicalLocation(backupFile)) {
+      throw new SnapshotError('INVALID_OPTIONS', `snapshot and history backup resolve to the same location: ${backupFile}`);
+    }
   }
   return { file: positionals[0], port, historyFile };
 }
