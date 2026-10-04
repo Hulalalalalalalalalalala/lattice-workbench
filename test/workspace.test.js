@@ -26,3 +26,43 @@ test('rejects duplicate and malformed identifiers', () => {
   assert.throws(() => workspace.add({ id: 'valid-id', title: 'Again', body: 'Body' }), /already exists/u);
   assert.throws(() => workspace.add({ id: 'Not Valid', title: 'Bad', body: 'Body' }), /URL-safe/u);
 });
+
+test('rejects a duplicate trimmed title and leaves the workspace untouched', () => {
+  const workspace = new Workspace();
+  workspace.add({ id: 'plan', title: '项目计划', body: 'Original body.', tags: ['Roadmap'] });
+  for (const title of ['项目计划', ' 项目计划 ']) {
+    let error = null;
+    try {
+      workspace.add({ id: 'other', title, body: 'Other body.' });
+    } catch (caught) {
+      error = caught;
+    }
+    assert.ok(error instanceof Error && !(error instanceof TypeError));
+    assert.equal(error.message, 'title already in use: 项目计划');
+    assert.equal(workspace.get('other'), null);
+  }
+  // The original document is intact and every query reflects the pre-add state.
+  assert.deepEqual(workspace.get('plan'), {
+    id: 'plan', title: '项目计划', body: 'Original body.', tags: ['roadmap'],
+  });
+  assert.deepEqual(workspace.list().map((document) => document.id), ['plan']);
+  assert.deepEqual(workspace.search('项目').map((document) => document.id), ['plan']);
+  const snapshot = workspace.exportJSON();
+  assert.throws(() => workspace.add({ id: 'other', title: '项目计划', body: 'Other body.' }), /title already in use/u);
+  assert.deepEqual(workspace.exportJSON(), snapshot);
+});
+
+test('titles stay case-sensitive and are released by removal', () => {
+  const workspace = new Workspace();
+  workspace.add({ id: 'upper', title: 'Plan', body: 'Upper.' });
+  workspace.add({ id: 'lower', title: 'plan', body: 'Lower.' });
+  assert.deepEqual(workspace.list().map((document) => document.id), ['lower', 'upper']);
+
+  // A removed document's title can be reused by a different id; before the
+  // removal it cannot.
+  assert.throws(() => workspace.add({ id: 'next', title: ' Plan ', body: 'Next.' }), /title already in use: Plan/u);
+  assert.equal(workspace.remove('upper'), true);
+  workspace.add({ id: 'next', title: ' Plan ', body: 'Next.' });
+  assert.equal(workspace.get('next').title, 'Plan');
+  assert.equal(workspace.get('upper'), null);
+});

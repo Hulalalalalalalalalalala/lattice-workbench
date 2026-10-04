@@ -488,6 +488,64 @@ test('batch title swap and release-then-reuse are order-independent', async () =
     });
     assert.equal(releaseReuse.status, 200);
     assert.equal(releaseReuse.body.documents.find((d) => d.id === 'c').title, 'Beta');
+    et = releaseReuse.etag;
+
+    // The same release-then-reuse listed in the opposite order commits too:
+    // create d with 'Alpha' (still held by b), then delete b.
+    const reuseRelease = await request(server.url, 'POST', '/batch', {
+      body: batch([
+        { type: 'create', document: { id: 'd', title: 'Alpha', body: 'd', tags: [] } },
+        { type: 'delete', id: 'b' },
+      ]),
+      headers: { 'if-match': et },
+    });
+    assert.equal(reuseRelease.status, 200);
+    assert.equal(reuseRelease.body.documents.find((d) => d.id === 'd').title, 'Alpha');
+    assert.ok(!reuseRelease.body.documents.some((d) => d.id === 'b'));
+  } finally {
+    await server.stop();
+  }
+});
+
+test('batch dryRun previews a title swap without changing state', async () => {
+  const cwd = tempDir();
+  writeSnapshot(path.join(cwd, 'snap.json'), workspaceWith([
+    { id: 'a', title: 'Alpha', body: 'a', tags: [] },
+    { id: 'b', title: 'Beta', body: 'b', tags: [] },
+  ]));
+  const server = await startServer([path.join(cwd, 'snap.json'), '--port', '0']);
+  try {
+    const et = (await request(server.url, 'GET', '/documents')).etag;
+    const swap = [
+      { type: 'replace', document: { id: 'a', title: 'Beta', body: 'a', tags: [] } },
+      { type: 'replace', document: { id: 'b', title: 'Alpha', body: 'b', tags: [] } },
+    ];
+    const preview = await request(server.url, 'POST', '/batch', {
+      body: batch(swap, { dryRun: true }),
+      headers: { 'if-match': et },
+    });
+    assert.equal(preview.status, 200);
+    assert.equal(preview.body.documents.find((d) => d.id === 'a').title, 'Beta');
+    assert.equal(preview.body.documents.find((d) => d.id === 'b').title, 'Alpha');
+
+    // The preview changed nothing.
+    const listed = await request(server.url, 'GET', '/documents');
+    assert.equal(listed.etag, et);
+    assert.equal(listed.body.find((d) => d.id === 'a').title, 'Alpha');
+    assert.equal(listed.body.find((d) => d.id === 'b').title, 'Beta');
+
+    // A preview whose final titles duplicate still fails and changes nothing.
+    const conflict = await request(server.url, 'POST', '/batch', {
+      body: batch([
+        { type: 'replace', document: { id: 'a', title: 'Beta', body: 'a', tags: [] } },
+      ], { dryRun: true }),
+      headers: { 'if-match': et },
+    });
+    assert.equal(conflict.status, 409);
+    assert.equal(conflict.body.code, 'CONFLICT');
+    const after = await request(server.url, 'GET', '/documents');
+    assert.equal(after.etag, et);
+    assert.equal(after.body.find((d) => d.id === 'a').title, 'Alpha');
   } finally {
     await server.stop();
   }

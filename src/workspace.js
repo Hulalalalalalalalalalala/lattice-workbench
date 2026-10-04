@@ -309,7 +309,14 @@ export class Workspace {
   add(input) {
     assertDocument(input);
     if (this.#documents.has(input.id)) throw new Error(`document already exists: ${input.id}`);
-    const document = Object.freeze({ id: input.id, title: input.title.trim(), body: input.body, tags: normalizeTags(input.tags ?? []) });
+    // Titles are unique across the workspace, compared case-sensitively after
+    // trimming surrounding whitespace — the same rule snapshot import
+    // enforces, so anything added here can always be exported and re-imported.
+    const title = input.title.trim();
+    for (const existing of this.#documents.values()) {
+      if (existing.title === title) throw new Error(`title already in use: ${title}`);
+    }
+    const document = Object.freeze({ id: input.id, title, body: input.body, tags: normalizeTags(input.tags ?? []) });
     this.#documents.set(document.id, document);
     return structuredClone(document);
   }

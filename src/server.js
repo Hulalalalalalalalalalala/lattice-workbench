@@ -401,8 +401,53 @@ export function createDocumentServer({ workspace, save, history = null }) {
       }
     }
 
+    // Title uniqueness is checked against the document set produced by the
+    // whole batch, never against intermediate states, so operation order
+    // cannot make a swap or release-then-reuse fail. The projection mirrors
+    // the post-commit list order so the reported title matches a check run
+    // after applying.
+    const removedIds = new Set();
+    const incoming = [];
+    for (const op of operations) {
+      if (op.type === 'create') {
+        incoming.push(op.document);
+      } else if (op.type === 'replace') {
+        removedIds.add(op.document.id);
+        incoming.push(op.document);
+      } else if (op.type === 'delete') {
+        removedIds.add(op.id);
+      } else {
+        removedIds.add(op.id);
+        incoming.push(ledger.entry(op.id, op.revision).document);
+      }
+    }
+    const projected = current.list().filter((document) => !removedIds.has(document.id)).concat(incoming)
+      .sort((a, b) => a.id.localeCompare(b.id));
+    const titles = new Set();
+    for (const document of projected) {
+      const title = document.title.trim();
+      if (titles.has(title)) {
+        throw new HttpError(409, 'CONFLICT', `title conflict in batch: ${title}`);
+      }
+      titles.add(title);
+    }
+
     const { snapshot, result } = commit((candidate, nextLedger) => {
       let changed = false;
+      // Removals run before additions: with uniqueness already verified
+      // against the final set, a title released by one operation is free for
+      // a later one whichever order the operations were listed in.
+      for (const op of operations) {
+        if (op.type === 'delete') {
+          candidate.remove(op.id);
+          if (nextLedger) nextLedger.record(op.id, 'delete', null);
+          changed = true;
+        } else if (op.type === 'replace') {
+          candidate.remove(op.document.id);
+        } else if (op.type === 'restore') {
+          candidate.remove(op.id);
+        }
+      }
       for (const op of operations) {
         if (op.type === 'create') {
           candidate.add(op.document);
@@ -410,21 +455,15 @@ export function createDocumentServer({ workspace, save, history = null }) {
           changed = true;
         } else if (op.type === 'replace') {
           const before = current.get(op.document.id);
-          candidate.remove(op.document.id);
           candidate.add(op.document);
           const stored = candidate.get(op.document.id);
           if (!sameDocument(before, stored)) {
             if (nextLedger) nextLedger.record(op.document.id, 'replace', stored);
             changed = true;
           }
-        } else if (op.type === 'delete') {
-          candidate.remove(op.id);
-          if (nextLedger) nextLedger.record(op.id, 'delete', null);
-          changed = true;
         } else if (op.type === 'restore') {
           const before = current.get(op.id);
           const target = ledger.entry(op.id, op.revision);
-          candidate.remove(op.id);
           candidate.add(target.document);
           const stored = candidate.get(op.id);
           if (!before || !sameDocument(before, stored)) {
@@ -432,16 +471,6 @@ export function createDocumentServer({ workspace, save, history = null }) {
             changed = true;
           }
         }
-      }
-
-      // Title conflicts are checked against the final projected set, so
-      // operation order cannot make a swap or release-then-reuse fail.
-      const titles = new Set();
-      for (const document of candidate.list()) {
-        if (titles.has(document.title)) {
-          throw new HttpError(409, 'CONFLICT', `title conflict in batch: ${document.title}`);
-        }
-        titles.add(document.title);
       }
 
       return changed;
