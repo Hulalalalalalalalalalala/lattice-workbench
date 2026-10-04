@@ -2,6 +2,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { SnapshotError, Workspace, assertDocument, normalizeTags } from './workspace.js';
+import { realLocation } from './paths.js';
 
 const PACKAGE_VERSION = 1;
 const MANIFEST_FILE = 'manifest.json';
@@ -155,27 +156,6 @@ export function parsePackage(manifestRaw, fileBytes) {
 }
 
 // ---- Path helpers ----------------------------------------------------------
-
-// Resolves symlinks of every existing path component, appending a nonexistent
-// tail lexically, so aliased paths compare by their real on-disk location.
-function realLocation(target) {
-  let current = path.resolve(target);
-  const tail = [];
-  for (;;) {
-    try {
-      const real = fs.realpathSync(current);
-      return tail.length === 0 ? real : path.join(real, ...tail.reverse());
-    } catch (error) {
-      if (error.code !== 'ENOENT' && error.code !== 'ENOTDIR') {
-        throw ioError(`cannot resolve ${target}: ${error.message}`);
-      }
-      tail.push(path.basename(current));
-      const parent = path.dirname(current);
-      if (parent === current) return current;
-      current = parent;
-    }
-  }
-}
 
 function isInside(candidate, directory) {
   const relative = path.relative(directory, candidate);

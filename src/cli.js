@@ -5,6 +5,7 @@ import { createDocumentServer } from './server.js';
 import { HistoryStore, loadHistoryFile } from './history.js';
 import { exportMarkdown, importMarkdown } from './markdown-pkg.js';
 import { SnapshotError, Workspace, snapshotFromDocuments } from './workspace.js';
+import { realLocation } from './paths.js';
 
 function demo() {
   const workspace = new Workspace();
@@ -161,8 +162,24 @@ function parseServeArgs(args) {
   if (positionals.length !== 1) {
     throw new SnapshotError('INVALID_OPTIONS', 'usage: serve <snapshot> [--port <port>] [--history <file>]');
   }
-  if (historyFile !== null && path.resolve(positionals[0]) === path.resolve(historyFile)) {
-    throw new SnapshotError('INVALID_OPTIONS', 'snapshot and history must be different files');
+  if (historyFile !== null) {
+    // The history commit moves the old history aside to <history>.bak and
+    // deletes that backup afterwards, so the content snapshot must occupy
+    // neither location: a snapshot placed there would be moved or deleted on
+    // startup or on the first save. Compare real locations so relative
+    // paths, '.'/'..' spellings, and symlinked aliases are caught even before
+    // any of the files exist. This runs before the snapshot is read, so a
+    // conflicting layout is reported ahead of any INVALID_SNAPSHOT/
+    // INVALID_HISTORY.
+    const snapshotReal = realLocation(positionals[0]);
+    const historyReal = realLocation(historyFile);
+    if (snapshotReal === historyReal) {
+      throw new SnapshotError('INVALID_OPTIONS', 'snapshot must not share a location with the history file');
+    }
+    const backupReal = realLocation(`${historyFile}.bak`);
+    if (snapshotReal === backupReal) {
+      throw new SnapshotError('INVALID_OPTIONS', 'snapshot must not occupy the history backup location (<history>.bak)');
+    }
   }
   return { file: positionals[0], port, historyFile };
 }
