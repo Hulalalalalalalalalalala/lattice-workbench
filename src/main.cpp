@@ -1,6 +1,13 @@
-#include <openssl/core_names.h>
 #include <openssl/evp.h>
+#include <openssl/opensslv.h>
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+// The EVP_MAC API only exists in OpenSSL 3.x.
+#include <openssl/core_names.h>
 #include <openssl/params.h>
+#else
+// OpenSSL 1.1.1 provides the one-shot HMAC() interface instead.
+#include <openssl/hmac.h>
+#endif
 
 #include <array>
 #include <cstddef>
@@ -74,11 +81,19 @@ bool readFileBytes(const std::string& path, std::vector<unsigned char>& out) {
     return true;
 }
 
-// Compute HMAC-SHA-256 with the standard OpenSSL EVP MAC implementation.
+// Compute a standard HMAC-SHA-256 tag with OpenSSL. OpenSSL 3.x uses the
+// EVP_MAC API; OpenSSL 1.1.1 does not have it, so there the one-shot HMAC()
+// function is used. Both implement the same standard HMAC construction
+// (keys longer than the SHA-256 block size are hashed first), so identical
+// key and message bytes yield identical tags on either version.
 bool hmacSha256(const std::vector<unsigned char>& key,
                 const std::vector<unsigned char>& message,
                 std::array<unsigned char, EVP_MAX_MD_SIZE>& mac,
                 std::size_t& macLength) {
+    const unsigned char* msg =
+        message.empty() ? reinterpret_cast<const unsigned char*>("")
+                        : message.data();
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
     bool ok = false;
     EVP_MAC* algo = EVP_MAC_fetch(nullptr, "HMAC", nullptr);
     EVP_MAC_CTX* ctx = algo ? EVP_MAC_CTX_new(algo) : nullptr;
@@ -87,9 +102,6 @@ bool hmacSha256(const std::vector<unsigned char>& key,
         params[0] = OSSL_PARAM_construct_utf8_string(
             OSSL_MAC_PARAM_DIGEST, const_cast<char*>("SHA256"), 0);
         params[1] = OSSL_PARAM_construct_end();
-        const unsigned char* msg =
-            message.empty() ? reinterpret_cast<const unsigned char*>("")
-                            : message.data();
         size_t outLength = 0;
         ok = EVP_MAC_init(ctx, key.data(), key.size(), params) == 1 &&
              EVP_MAC_update(ctx, msg, message.size()) == 1 &&
@@ -101,6 +113,15 @@ bool hmacSha256(const std::vector<unsigned char>& key,
     EVP_MAC_CTX_free(ctx);
     EVP_MAC_free(algo);
     return ok;
+#else
+    unsigned int outLength = 0;
+    if (HMAC(EVP_sha256(), key.data(), static_cast<int>(key.size()), msg,
+             message.size(), mac.data(), &outLength) == nullptr) {
+        return false;
+    }
+    macLength = outLength;
+    return true;
+#endif
 }
 
 int runTag(int argc, char* argv[]) {
