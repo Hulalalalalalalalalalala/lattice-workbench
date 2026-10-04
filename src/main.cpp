@@ -1,6 +1,10 @@
-#include <openssl/core_names.h>
+// HMAC() from <openssl/hmac.h> is available in both OpenSSL 1.1.1 and
+// OpenSSL 3.x. OpenSSL 3.x marks it deprecated in favour of the EVP_MAC
+// interface (which 1.1.1 does not have); suppress those deprecation
+// warnings so the portable interface builds cleanly on 3.x.
+#define OPENSSL_SUPPRESS_DEPRECATED
 #include <openssl/evp.h>
-#include <openssl/params.h>
+#include <openssl/hmac.h>
 
 #include <array>
 #include <cstddef>
@@ -74,33 +78,27 @@ bool readFileBytes(const std::string& path, std::vector<unsigned char>& out) {
     return true;
 }
 
-// Compute HMAC-SHA-256 with the standard OpenSSL EVP MAC implementation.
+// Compute HMAC-SHA-256 with the one-shot HMAC() interface from libcrypto.
+// It exists in both OpenSSL 1.1.1 and OpenSSL 3.x and implements the
+// standard HMAC construction (RFC 2104), so keys longer than the SHA-256
+// block size are hashed exactly as the standard requires and both
+// environments produce identical tags.
 bool hmacSha256(const std::vector<unsigned char>& key,
                 const std::vector<unsigned char>& message,
                 std::array<unsigned char, EVP_MAX_MD_SIZE>& mac,
                 std::size_t& macLength) {
-    bool ok = false;
-    EVP_MAC* algo = EVP_MAC_fetch(nullptr, "HMAC", nullptr);
-    EVP_MAC_CTX* ctx = algo ? EVP_MAC_CTX_new(algo) : nullptr;
-    if (ctx) {
-        OSSL_PARAM params[2];
-        params[0] = OSSL_PARAM_construct_utf8_string(
-            OSSL_MAC_PARAM_DIGEST, const_cast<char*>("SHA256"), 0);
-        params[1] = OSSL_PARAM_construct_end();
-        const unsigned char* msg =
-            message.empty() ? reinterpret_cast<const unsigned char*>("")
-                            : message.data();
-        size_t outLength = 0;
-        ok = EVP_MAC_init(ctx, key.data(), key.size(), params) == 1 &&
-             EVP_MAC_update(ctx, msg, message.size()) == 1 &&
-             EVP_MAC_final(ctx, mac.data(), &outLength, mac.size()) == 1;
-        if (ok) {
-            macLength = outLength;
-        }
+    // The key is validated to be non-empty before this is called, so
+    // key.data() is always valid. A null message pointer with length 0 is
+    // accepted and authenticates the empty message.
+    const unsigned char* msg =
+        message.empty() ? nullptr : message.data();
+    unsigned int outLength = 0;
+    if (HMAC(EVP_sha256(), key.data(), static_cast<int>(key.size()), msg,
+             message.size(), mac.data(), &outLength) == nullptr) {
+        return false;
     }
-    EVP_MAC_CTX_free(ctx);
-    EVP_MAC_free(algo);
-    return ok;
+    macLength = outLength;
+    return true;
 }
 
 int runTag(int argc, char* argv[]) {
