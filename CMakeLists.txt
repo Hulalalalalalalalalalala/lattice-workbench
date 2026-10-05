@@ -47,3 +47,22 @@ add_executable(messagetag src/main.cpp)
 target_compile_features(messagetag PRIVATE cxx_std_20)
 set_target_properties(messagetag PROPERTIES CXX_EXTENSIONS OFF)
 target_link_libraries(messagetag PRIVATE OpenSSL::Crypto)
+
+# Regression tests: known-answer vectors (RFC 4231 and independently
+# computed HMAC-SHA-256 tags) plus the documented CLI contract, driven by
+# tests/regression.py.  Run with `ctest --test-dir build` or directly:
+# `python3 tests/regression.py ./build/messagetag`.
+include(CTest)
+if(BUILD_TESTING)
+    find_package(Python3 COMPONENTS Interpreter)
+    if(Python3_Interpreter_FOUND)
+        add_test(NAME regression
+                 COMMAND "${Python3_EXECUTABLE}"
+                         "${CMAKE_CURRENT_SOURCE_DIR}/tests/regression.py"
+                         "$<TARGET_FILE:messagetag>")
+    else()
+        message(WARNING
+            "Python 3 interpreter not found; the 'regression' test is "
+            "disabled. Install Python 3 to enable it.")
+    endif()
+endif()

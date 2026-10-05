@@ -80,3 +80,21 @@ printf 'hello\n' > msg.txt
 ```
 
 注意末尾换行属于消息的一部分；若文件内容是不带换行的 `hello`，得到的标签会不同。
+
+## 回归测试
+
+`tests/regression.py` 固化了对上述公开行为的回归保障：期望值全部来自独立于本程序的已知答案（RFC 4231 公布的 HMAC-SHA-256 测试向量，以及用 Python `hmac`/`hashlib` 独立计算后冻结的标签），覆盖密钥解码（大小写、前导零、超过 64 字节块的长密钥）、文件内容（空文件、零字节、末尾换行、CRLF 不转换、超过 64 KiB 且非 64 KiB 整数倍的文件、路径不参与认证）以及命令行契约（输出格式、退出码 0/1/2、错误不回显密钥）。需要 Python 3。
+
+构建后通过 CTest 运行：
+
+```sh
+ctest --test-dir build --output-on-failure
+```
+
+或直接运行：
+
+```sh
+python3 tests/regression.py ./build/messagetag
+```
+
+失败时测试名即指出哪一项已公开行为发生了变化。
