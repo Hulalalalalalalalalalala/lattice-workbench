@@ -47,3 +47,26 @@ add_executable(messagetag src/main.cpp)
 target_compile_features(messagetag PRIVATE cxx_std_20)
 set_target_properties(messagetag PROPERTIES CXX_EXTENSIONS OFF)
 target_link_libraries(messagetag PRIVATE OpenSSL::Crypto)
+
+# Regression tests (tests/regression_test.py) pin the documented tag output
+# to independently computed HMAC-SHA-256 values (RFC 4231 + Python's hmac).
+# They only need a Python 3 interpreter; the build itself still works without
+# one, but 'ctest' then has nothing to run, which is announced at configure
+# time so the missing safety net does not pass silently.
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if(Python3_Interpreter_FOUND)
+    enable_testing()
+    add_test(
+        NAME regression
+        COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/regression_test.py"
+                "$<TARGET_FILE:messagetag>")
+    set_tests_properties(regression PROPERTIES
+        LABELS "regression"
+        TIMEOUT 120)
+else()
+    message(WARNING
+        "Python 3 was not found, so the 'regression' ctest is not "
+        "registered. Install Python 3 to run the tag-output regression "
+        "suite ('ctest' after building).")
+endif()

@@ -80,3 +80,22 @@ printf 'hello\n' > msg.txt
 ```
 
 注意末尾换行属于消息的一部分；若文件内容是不带换行的 `hello`，得到的标签会不同。
+
+## 回归测试
+
+自动回归测试位于 `tests/regression_test.py`，构建后用 CTest 运行（需要 Python 3，仅用于测试，不影响程序构建）：
+
+```sh
+cmake -S . -B build
+cmake --build build
+ctest --test-dir build --output-on-failure
+```
+
+也可直接运行：`python3 tests/regression_test.py ./build/messagetag`。
+
+期望值不取自本程序自己的输出，而是有两个相互独立的确定依据：
+
+- [RFC 4231](https://www.rfc-editor.org/rfc/rfc4231.html) 第 4 节公布的 HMAC-SHA-256 标准向量，其中包含 **131 字节、超过 SHA-256 的 64 字节块大小**的密钥用例；
+- Python 标准库 `hmac`/`hashlib` 在测试运行时重新计算的结果，并与测试中硬编码的常量再次比对。
+
+测试覆盖：空文件、含零字节且零字节后仍有内容的消息、LF/CR/CRLF 不互相转换、带不带末尾换行分别对应不同标签、长度为 131195 字节（超过 64 KiB 且不是 64 KiB 整数倍）的文件且首/中/尾字节改动都能被发现、相同内容在不同路径下标签一致、密钥十六进制大小写等价、前导零字节保留（包括超长密钥的情形）；并检查成功时标准输出恰为 64 个小写十六进制字符加一个换行、标准错误为空、退出码为 0，奇数长度/非十六进制密钥以退出码 2 结束且不回显密钥，文件无法打开以退出码 1 结束且不输出任何标签；`--version` 的既有行为也保持固定。
