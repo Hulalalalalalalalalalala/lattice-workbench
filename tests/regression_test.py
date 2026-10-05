@@ -35,15 +35,26 @@ import unittest
 # Fixture recipes
 # ---------------------------------------------------------------------------
 
-LARGE_LEN = 2 * 65536 + 123          # > 64 KiB and not a multiple of 64 KiB
+# The tagger streams the file through a fixed 65536-byte (64 KiB) read
+# buffer; messages whose length is exactly a multiple of this size are the
+# boundary at which an implementation can most easily confuse "read the
+# whole final chunk, no remainder" for failure, duplicate the last chunk, or
+# stop one chunk early.
+READ_CHUNK = 65536
+LARGE_LEN = 2 * READ_CHUNK + 123     # > 64 KiB and not a multiple of 64 KiB
 LARGE_KEY_HEX = "0123456789abcdef" * 4   # 32-byte key
 
 
+def pattern_bytes(n):
+    """n bytes whose value depends on every position. Dropping, repeating or
+    reordering any byte changes the tag, so exact-chunk-boundary messages
+    built from this pattern expose a repeated or omitted final chunk."""
+    return bytes((i * 31 + 7) % 256 for i in range(n))
+
+
 def large_bytes():
-    """131195 bytes whose value depends on every position: two whole 64 KiB
-    read chunks plus a 123-byte tail. Dropping, repeating or reordering any
-    byte changes the tag."""
-    return bytes((i * 31 + 7) % 256 for i in range(LARGE_LEN))
+    """131195 bytes: two whole 64 KiB read chunks plus a 123-byte tail."""
+    return pattern_bytes(LARGE_LEN)
 
 
 # ---------------------------------------------------------------------------
@@ -125,6 +136,31 @@ _mid_msg[70000] ^= 0xFF
 PROJECT_VECTORS.append(
     ("large_mid", LARGE_KEY_HEX, bytes(_mid_msg),
      "4b27ce3500f1809311e794fd10e2e4afc4278ebd11435835746a13f7fb41aa2f"))
+
+# Messages whose length is exactly one, two or three whole read chunks:
+# after the final full read there is no remainder and no extra short read,
+# which must still count as a clean EOF -- not as a read failure, and
+# without repeating or dropping the last chunk. One byte on either side of
+# the first boundary pins the short-tail path too, including a flip of the
+# last byte of the 65537-byte message so the final one-byte tail provably
+# participates.
+_plus1 = pattern_bytes(READ_CHUNK + 1)
+_plus1_lastflip = _plus1[:-1] + bytes([_plus1[-1] ^ 0x01])
+PROJECT_VECTORS.extend([
+    ("boundary_exact1", LARGE_KEY_HEX, pattern_bytes(READ_CHUNK),
+     "6f301cd9cc12bf1a49379adcd184d301a956c054bd5f7f80dd2d0f3b782a2f1a"),
+    ("boundary_exact2", LARGE_KEY_HEX, pattern_bytes(2 * READ_CHUNK),
+     "fbb309b50fd850c6425788ae6ca4ac5823a1daa35065acb05309a921edc98aa8"),
+    ("boundary_exact3", LARGE_KEY_HEX, pattern_bytes(3 * READ_CHUNK),
+     "51775e0c077fe81f4a85d44710b436ecb8c1df82ff7ac8b5aa14f58effee59ef"),
+    ("boundary_minus1", LARGE_KEY_HEX, pattern_bytes(READ_CHUNK - 1),
+     "edbaae0d8dd2782c28496eecc0802f5f837afd22463a5764d388832ebcbc4603"),
+    ("boundary_plus1", LARGE_KEY_HEX, _plus1,
+     "a18cc718535210b3c60d2b2c2131c133f3fc4ea7a3aba6937f80615a67f785b8"),
+    ("boundary_plus1_lastflip", LARGE_KEY_HEX, _plus1_lastflip,
+     "17083eada3fea50246930a4ae1c7b662d539122f14e49020b16421a9d1d59162"),
+])
+del _plus1, _plus1_lastflip, _mid_msg
 
 TAG_RE = re.compile(rb"\A[0-9a-f]{64}\n\Z")
 
@@ -287,6 +323,58 @@ class TagRegression(unittest.TestCase):
         self.assertEqual(a.stdout, b.stdout)
         self.assertEqual(a.stdout, c.stdout)
 
+    def test_17_exact_chunk_sized_messages_end_normally(self):
+        """Lengths of exactly 65536 bytes and integer multiples thereof must
+        authenticate ALL raw bytes: a final full read with zero remaining
+        bytes is a normal EOF, not a failure, and the last chunk is neither
+        repeated nor dropped. Lengths one byte short/long pin the remainder
+        path; the empty message stays valid (covered elsewhere)."""
+        # Exact tags are pinned in PROJECT_VECTORS with independent stdlib
+        # and hard-coded anchors; repeat the end-of-file contract here
+        # explicitly at every whole-chunk boundary.
+        for name, length in (("boundary_exact1", READ_CHUNK),
+                             ("boundary_exact2", 2 * READ_CHUNK),
+                             ("boundary_exact3", 3 * READ_CHUNK)):
+            with self.subTest(fixture=name):
+                with open(self.fixture(name), "rb") as f:
+                    on_disk = f.read()
+                self.assertEqual(len(on_disk), length)
+                self.assertEqual(length % READ_CHUNK, 0)
+                self.assertTagSuccess(
+                    self.run_tag(LARGE_KEY_HEX, self.fixture(name)),
+                    expected_hmac(LARGE_KEY_HEX, on_disk), name)
+
+        for name in ("boundary_minus1", "boundary_plus1",
+                     "boundary_plus1_lastflip"):
+            with self.subTest(fixture=name):
+                with open(self.fixture(name), "rb") as f:
+                    on_disk = f.read()
+                self.assertTagSuccess(
+                    self.run_tag(LARGE_KEY_HEX, self.fixture(name)),
+                    expected_hmac(LARGE_KEY_HEX, on_disk), name)
+
+        # Direct degeneration checks against independently computed tags:
+        # the 2-chunk message must not authenticate with its final chunk
+        # dropped, nor with the final chunk fed a second time.
+        two = pattern_bytes(2 * READ_CHUNK)
+        actual = self.run_tag(LARGE_KEY_HEX,
+                              self.fixture("boundary_exact2")).stdout
+        dropped = (expected_hmac(LARGE_KEY_HEX, two[:READ_CHUNK])
+                   + "\n").encode()
+        repeated = (expected_hmac(
+            LARGE_KEY_HEX, two + two[READ_CHUNK:]) + "\n").encode()
+        self.assertNotEqual(actual, dropped,
+                            "tag matches a one-chunk-short (dropped) read")
+        self.assertNotEqual(actual, repeated,
+                            "tag matches a duplicated final chunk")
+        # The one-byte tail of boundary_plus1 really participates: flipping
+        # that last byte changes the tag.
+        self.assertNotEqual(
+            self.run_tag(LARGE_KEY_HEX,
+                         self.fixture("boundary_plus1")).stdout,
+            self.run_tag(LARGE_KEY_HEX,
+                         self.fixture("boundary_plus1_lastflip")).stdout)
+
     # -- key interpretation -------------------------------------------------
 
     def test_20_hex_case_insensitive(self):
@@ -411,6 +499,96 @@ class TagRegression(unittest.TestCase):
                 self.assertIn(b"read", result.stderr.lower())
             finally:
                 os.chmod(locked, stat.S_IRUSR | stat.S_IWUSR)
+
+    def test_34_read_error_after_nonempty_prefix_exit_1(self):
+        """The file opens fine and a non-empty prefix is already fed into
+        HMAC, and THEN a read fails: the whole operation must end with exit
+        code 1, zero bytes on stdout and a read-failure message on stderr.
+        Even though the prefix alone would yield a perfectly valid tag, it
+        must not be printed, the fault must not be mistaken for a normal
+        EOF, and it must not be reported as key-format error (exit 2).
+
+        The open-failure case in test_33 cannot guarantee this: by the time
+        the fault below strikes, open() has succeeded and bytes have been
+        digested. The fault is injected deterministically with strace's
+        path-scoped error injection ('-P <message file>' makes the injected
+        EIO hit only reads of THIS fd, so the dynamic loader's own reads
+        are untouched), which neither relies on file permissions nor on the
+        current account lacking read access to an ordinary file."""
+        strace = shutil.which("strace")
+        if strace is None:
+            self.skipTest("strace is required to inject a mid-read error")
+
+        # 200000 bytes: three whole 64 KiB chunks plus a tail, so at least
+        # one full non-empty chunk has been digested before each fault.
+        fault_file = os.path.join(self.tmpdir, "readfault.bin")
+        data = pattern_bytes(200000)
+        with open(fault_file, "wb") as f:
+            f.write(data)
+        # The tag the digested prefix alone WOULD produce; it must never
+        # appear anywhere in the output. Computed independently of the
+        # program under test.
+        prefix_tag = expected_hmac(LARGE_KEY_HEX, data[:READ_CHUNK])
+
+        # when=2 faults the 2nd read of the message fd (after one full
+        # chunk); when=3 faults after two full chunks. Both fault points are
+        # inside the read loop, at different positions, and neither is at
+        # EOF.
+        for when in (2, 3):
+            with self.subTest(fault_on_read=when):
+                log = os.path.join(self.tmpdir, f"strace-readfault-{when}.log")
+                proc = subprocess.run(
+                    [strace, "-f", "-P", fault_file,
+                     "-e", "trace=openat,read",
+                     "-e", f"inject=read:error=EIO:when={when}",
+                     "-o", log,
+                     self.exe, "tag", "--key-hex", LARGE_KEY_HEX,
+                     "--file", fault_file],
+                    capture_output=True)
+
+                # Prove independently that the scenario really occurred:
+                # at least one successful full-chunk read followed by an
+                # injected EIO on the same path. Without this evidence the
+                # assertions below could pass/fail for the wrong reason
+                # (e.g. ptrace forbidden, strace never running the child).
+                if os.path.exists(log):
+                    with open(log, "r", errors="replace") as f:
+                        trace = f.read()
+                else:
+                    trace = ""
+                if "(INJECTED)" not in trace:
+                    if (b"ptrace" in proc.stderr
+                            or b"Operation not permitted" in proc.stderr):
+                        self.skipTest(
+                            "strace cannot ptrace in this environment, so "
+                            "the mid-read-error injection could not run")
+                    self.fail(
+                        "strace did not inject the read fault (log=%r, "
+                        "stderr=%r); cannot guarantee the mid-read-error "
+                        "contract" % (trace[-400:], proc.stderr[-400:]))
+                self.assertRegex(
+                    trace,
+                    r"read\(\d+, .*?, 65536\)\s*=\s*65536\n"
+                    r"[^\n]*EIO \(Input/output error\) \(INJECTED\)",
+                    "a non-empty prefix must have been read before the fault")
+
+                self.assertEqual(
+                    proc.returncode, 1,
+                    f"fault on read {when}: expected exit 1 (read failure), "
+                    f"got {proc.returncode}; stderr={proc.stderr!r}")
+                self.assertEqual(
+                    proc.stdout, b"",
+                    "a read failure after a partial read must not print "
+                    "any tag, not even the one for the digested prefix")
+                self.assertNotRegex(proc.stderr, rb"[0-9a-f]{64}",
+                                    "no tag-like output may leak to stderr")
+                self.assertNotIn(prefix_tag.encode(), proc.stderr)
+                self.assertNotRegex(proc.stderr, rb"\A\s*\Z",
+                                    "stderr must explain the read failure")
+                self.assertIn(b"read", proc.stderr.lower())
+                # Exit 2 is the argument/key-format channel; a mid-read I/O
+                # failure must never be classified that way.
+                self.assertNotEqual(proc.returncode, 2)
 
     # -- entry-point compatibility -----------------------------------------
 
