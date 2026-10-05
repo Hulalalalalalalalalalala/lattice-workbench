@@ -511,6 +511,74 @@ class TagRegression(unittest.TestCase):
         self.assertEqual(r.returncode, 2)
         self.assertEqual(r.stdout, b"")
 
+    def test_35_option_name_after_option_is_missing_value(self):
+        """A value-taking option immediately followed by one of this
+        command's option names (including the same name again) is a
+        missing-value usage error: exit 2, empty stdout, the diagnostic
+        names the option and gives the tag usage. The following option
+        must not be consumed as a value, so no file read is attempted."""
+        path = self.fixture("hello_lf")
+        invocations = [
+            # The reported case: the second --file is not a file name.
+            [self.exe, "tag", "--key-hex", "0001", "--file", "--file"],
+            [self.exe, "tag", "--key-hex", "--file", path],
+            [self.exe, "tag", "--file", "--key-hex", "0001"],
+            [self.exe, "tag", "--key-hex", "--key-hex", "0001",
+             "--file", path],
+            [self.exe, "tag", "--file", path, "--key-hex"],
+        ]
+        for argv in invocations:
+            with self.subTest(argv=argv[2:]):
+                r = subprocess.run(argv, capture_output=True)
+                self.assertEqual(r.returncode, 2,
+                                 f"{argv[2:]}: expected exit 2, got "
+                                 f"{r.returncode}; stderr={r.stderr!r}")
+                self.assertEqual(r.stdout, b"")
+                self.assertIn(b"requires a value", r.stderr)
+                self.assertIn(b"Usage: messagetag tag", r.stderr)
+
+    def test_36_dash_named_files_and_empty_values(self):
+        """Only an exact option-name match triggers the missing-value
+        rule. A token that merely starts with a dash ("--notes") is still
+        a file path; a file literally named "--file" stays usable via an
+        explicit path prefix; and an explicitly empty value keeps its own
+        diagnostic instead of becoming a missing-value error."""
+        hello_tag = ("307a25cbcb6cbca48f5dd2b05fd9174c"
+                     "0cf17580f4ea8dd667092f11a77b4d5d")
+        # "--notes" after --file is a path, not an option.
+        with open(os.path.join(self.tmpdir, "--notes"), "wb") as f:
+            f.write(b"hello\n")
+        r = subprocess.run(
+            [self.exe, "tag", "--key-hex", "0001", "--file", "--notes"],
+            capture_output=True, cwd=self.tmpdir)
+        self.assertTagSuccess(r, hello_tag, "file named --notes")
+
+        # A file literally named "--file" works via ./--file ...
+        with open(os.path.join(self.tmpdir, "--file"), "wb") as f:
+            f.write(b"hello\n")
+        r = subprocess.run(
+            [self.exe, "tag", "--key-hex", "0001", "--file", "./--file"],
+            capture_output=True, cwd=self.tmpdir)
+        self.assertTagSuccess(r, hello_tag, "file named --file via ./")
+
+        # ... but the bare "--file" is a missing-value error even though
+        # a file by that name exists right there.
+        r = subprocess.run(
+            [self.exe, "tag", "--key-hex", "0001", "--file", "--file"],
+            capture_output=True, cwd=self.tmpdir)
+        self.assertEqual(r.returncode, 2)
+        self.assertEqual(r.stdout, b"")
+        self.assertIn(b"requires a value", r.stderr)
+
+        # An explicitly empty file path is a read failure (exit 1), not a
+        # missing-value error.
+        r = subprocess.run(
+            [self.exe, "tag", "--key-hex", "0001", "--file", ""],
+            capture_output=True)
+        self.assertEqual(r.returncode, 1)
+        self.assertEqual(r.stdout, b"")
+        self.assertIn(b"read", r.stderr.lower())
+
     def test_33_unopenable_file_exit_1(self):
         missing = os.path.join(self.tmpdir, "does-not-exist.bin")
         result = self.run_tag("0001", missing)
@@ -916,6 +984,54 @@ class VerifyRegression(unittest.TestCase):
             with self.subTest(argv=argv[2:]):
                 r = subprocess.run(argv, capture_output=True)
                 self.assertUsageError(r, repr(argv))
+
+    def test_74_option_name_after_option_is_missing_value(self):
+        """A value-taking option immediately followed by one of verify's
+        option names (including the same name again) is a missing-value
+        usage error -- reported before any file is read -- even when the
+        other options carry a perfectly valid key and tag, and even when
+        a file with the option's name actually exists."""
+        path = self.fixture("hello_lf")
+        good = "307a25cbcb6cbca48f5dd2b05fd9174c0cf17580f4ea8dd667092f11a77b4d5d"
+        invocations = [
+            [self.exe, "verify", "--key-hex", "0001", "--file", path,
+             "--tag-hex", "--tag-hex"],
+            [self.exe, "verify", "--key-hex", "0001", "--file",
+             "--tag-hex", good],
+            [self.exe, "verify", "--key-hex", "--file", path,
+             "--tag-hex", good],
+            [self.exe, "verify", "--file", "--file", "--key-hex", "0001",
+             "--tag-hex", good],
+            [self.exe, "verify", "--tag-hex", "--key-hex", "0001",
+             "--file", path],
+        ]
+        for argv in invocations:
+            with self.subTest(argv=argv[2:]):
+                r = subprocess.run(argv, capture_output=True)
+                self.assertUsageError(r, repr(argv))
+                self.assertIn(b"requires a value", r.stderr)
+                self.assertNoSecretLeak(r, good, "0001", repr(argv))
+
+        # A file literally named "--file" existing in the working
+        # directory does not turn the missing value into a file read.
+        with open(os.path.join(self.tmpdir, "--file"), "wb") as f:
+            f.write(b"hello\n")
+        r = subprocess.run(
+            [self.exe, "verify", "--key-hex", "0001", "--file", "--file",
+             "--tag-hex", good],
+            capture_output=True, cwd=self.tmpdir)
+        self.assertUsageError(r, "existing file named --file")
+        self.assertIn(b"requires a value", r.stderr)
+
+        # A dash-leading token that is not one of verify's option names
+        # is still a value: "--notes" after --file is a file path.
+        with open(os.path.join(self.tmpdir, "--notes"), "wb") as f:
+            f.write(b"hello\n")
+        r = subprocess.run(
+            [self.exe, "verify", "--key-hex", "0001", "--file", "--notes",
+             "--tag-hex", good],
+            capture_output=True, cwd=self.tmpdir)
+        self.assertVerifyOk(r, "file named --notes")
 
     # -- read / computation failures ---------------------------------------
 

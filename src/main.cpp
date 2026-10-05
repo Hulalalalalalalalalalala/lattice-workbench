@@ -76,26 +76,41 @@ std::string hexEncode(const unsigned char* data, std::size_t length) {
 // collected values are stored keyed by option name, and the caller checks
 // which required options are present. Only the value-taking options named
 // in `names` are accepted.
+//
+// An option's value is missing not only when nothing follows it, but also
+// when the next token is itself one of this command's option names: in
+// "--file --file" the second "--file" is another option, not a file name,
+// so the first "--file" is reported as missing a value instead of
+// consuming the option as its value. Only an exact match with a recognized
+// option name triggers this; any other token (including one that merely
+// starts with a dash, such as "--notes", and including an explicitly empty
+// string) is taken as the value, so file paths with leading dashes stay
+// usable and empty values keep their own distinct diagnostics.
 bool parseValueOptions(int argc, char* argv[], std::string_view command,
                        std::string_view usage,
                        const std::vector<std::string_view>& names,
                        std::map<std::string, std::string>& values) {
-    for (int i = 2; i < argc; ++i) {
-        std::string arg(argv[i]);
-        bool recognized = false;
+    auto isOptionName = [&names](std::string_view arg) {
         for (std::string_view name : names) {
             if (arg == name) {
-                recognized = true;
-                break;
+                return true;
             }
         }
-        if (!recognized) {
+        return false;
+    };
+    for (int i = 2; i < argc; ++i) {
+        std::string arg(argv[i]);
+        if (!isOptionName(arg)) {
             std::cerr << "messagetag " << command
                       << ": error: unknown argument '" << arg << "'\n"
                       << usage;
             return false;
         }
-        if (i + 1 >= argc) {
+        // The diagnostic names only the option that lacks a value; the
+        // following token (a recognized option name, or nothing at all) is
+        // never spliced into the message, and neither is any key or tag
+        // material supplied elsewhere on the command line.
+        if (i + 1 >= argc || isOptionName(argv[i + 1])) {
             std::cerr << "messagetag " << command
                       << ": error: option '" << arg
                       << "' requires a value\n"
