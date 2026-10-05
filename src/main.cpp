@@ -13,6 +13,7 @@
 #include <cstddef>
 #include <fstream>
 #include <iostream>
+#include <map>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -22,6 +23,13 @@ namespace {
 
 constexpr std::string_view kTagUsage =
     "Usage: messagetag tag --key-hex <hex-key> --file <message-file>\n";
+
+constexpr std::string_view kVerifyUsage =
+    "Usage: messagetag verify --key-hex <hex-key> --file <message-file> "
+    "--tag-hex <hex-tag>\n";
+
+// SHA-256 HMAC tags are always 32 bytes / 64 hex characters.
+constexpr std::size_t kTagBytes = 32;
 
 // Decode hexadecimal into raw bytes: every two characters are one byte and
 // leading zeros must be preserved (e.g. "0001" is two bytes, not the number
@@ -59,6 +67,72 @@ std::string hexEncode(const unsigned char* data, std::size_t length) {
         out[2 * i + 1] = kHex[data[i] & 0x0F];
     }
     return out;
+}
+
+// Parse options of the form "--name value" starting at argv[2]. On a usage
+// problem (an unknown argument, or an option without a following value) a
+// command-specific diagnostic and the usage line are written to stderr and
+// this returns false; the caller then exits with code 2. On success the
+// collected values are stored keyed by option name, and the caller checks
+// which required options are present. Only the value-taking options named
+// in `names` are accepted.
+bool parseValueOptions(int argc, char* argv[], std::string_view command,
+                       std::string_view usage,
+                       const std::vector<std::string_view>& names,
+                       std::map<std::string, std::string>& values) {
+    for (int i = 2; i < argc; ++i) {
+        std::string arg(argv[i]);
+        bool recognized = false;
+        for (std::string_view name : names) {
+            if (arg == name) {
+                recognized = true;
+                break;
+            }
+        }
+        if (!recognized) {
+            std::cerr << "messagetag " << command
+                      << ": error: unknown argument '" << arg << "'\n"
+                      << usage;
+            return false;
+        }
+        if (i + 1 >= argc) {
+            std::cerr << "messagetag " << command
+                      << ": error: option '" << arg
+                      << "' requires a value\n"
+                      << usage;
+            return false;
+        }
+        values[arg] = argv[++i];
+    }
+    return true;
+}
+
+bool requireOption(const std::map<std::string, std::string>& values,
+                   std::string_view command, std::string_view usage,
+                   std::string_view name) {
+    if (values.find(std::string(name)) == values.end()) {
+        std::cerr << "messagetag " << command
+                  << ": error: missing required option '" << name << "'\n"
+                  << usage;
+        return false;
+    }
+    return true;
+}
+
+// Decode the --key-hex argument, emitting the shared key-format diagnostic
+// (which never echoes the submitted key) on failure.
+bool parseKey(std::string_view command, std::string_view usage,
+              const std::string& keyHex, std::vector<unsigned char>& key) {
+    if (decodeHex(keyHex, key)) {
+        return true;
+    }
+    std::cerr << "messagetag " << command
+              << ": error: invalid --key-hex: expected a non-empty, "
+                 "even-length string of hexadecimal characters (0-9, a-f, A-F); "
+                 "every two characters denote one key byte and leading zeros must "
+                 "be kept; a 0x prefix and whitespace are not accepted\n"
+              << usage;
+    return false;
 }
 
 // Stream the message file into HMAC-SHA-256 a fixed-size chunk at a time.
@@ -131,53 +205,21 @@ HmacStatus hmacSha256File(const std::vector<unsigned char>& key,
 
 int runTag(int argc, char* argv[]) {
     // argv[1] is the "tag" subcommand name; option parsing starts at argv[2].
-    std::string keyHex;
-    std::string filePath;
-    bool haveKeyHex = false;
-    bool haveFile = false;
-
-    for (int i = 2; i < argc; ++i) {
-        std::string arg(argv[i]);
-        if (arg == "--key-hex" || arg == "--file") {
-            if (i + 1 >= argc) {
-                std::cerr << "messagetag tag: error: option '" << arg
-                          << "' requires a value\n"
-                          << kTagUsage;
-                return 2;
-            }
-            std::string value = argv[++i];
-            if (arg == "--key-hex") {
-                keyHex = value;
-                haveKeyHex = true;
-            } else {
-                filePath = value;
-                haveFile = true;
-            }
-        } else {
-            std::cerr << "messagetag tag: error: unknown argument '" << arg << "'\n"
-                      << kTagUsage;
-            return 2;
-        }
-    }
-
-    if (!haveKeyHex) {
-        std::cerr << "messagetag tag: error: missing required option '--key-hex'\n"
-                  << kTagUsage;
+    std::map<std::string, std::string> opts;
+    if (!parseValueOptions(
+            argc, argv, "tag", kTagUsage,
+            std::vector<std::string_view>{"--key-hex", "--file"}, opts)) {
         return 2;
     }
-    if (!haveFile) {
-        std::cerr << "messagetag tag: error: missing required option '--file'\n"
-                  << kTagUsage;
+    if (!requireOption(opts, "tag", kTagUsage, "--key-hex") ||
+        !requireOption(opts, "tag", kTagUsage, "--file")) {
         return 2;
     }
+    const std::string& keyHex = opts["--key-hex"];
+    const std::string& filePath = opts["--file"];
 
     std::vector<unsigned char> key;
-    if (!decodeHex(keyHex, key)) {
-        std::cerr << "messagetag tag: error: invalid --key-hex: expected a non-empty, "
-                     "even-length string of hexadecimal characters (0-9, a-f, A-F); "
-                     "every two characters denote one key byte and leading zeros must "
-                     "be kept; a 0x prefix and whitespace are not accepted\n"
-                  << kTagUsage;
+    if (!parseKey("tag", kTagUsage, keyHex, key)) {
         return 2;
     }
 
@@ -199,6 +241,91 @@ int runTag(int argc, char* argv[]) {
     return 0;
 }
 
+// Compare two fixed-length byte strings without leaking the length of any
+// matching prefix: the loop always touches every byte and accumulates all
+// differences, so the running time does not depend on where (or whether)
+// the inputs differ.
+bool constantTimeEqual(const unsigned char* a, const unsigned char* b,
+                       std::size_t length) {
+    unsigned char diff = 0;
+    for (std::size_t i = 0; i < length; ++i) {
+        diff |= static_cast<unsigned char>(a[i] ^ b[i]);
+    }
+    return diff == 0;
+}
+
+int runVerify(int argc, char* argv[]) {
+    // argv[1] is the "verify" subcommand name; parsing starts at argv[2].
+    std::map<std::string, std::string> opts;
+    if (!parseValueOptions(
+            argc, argv, "verify", kVerifyUsage,
+            std::vector<std::string_view>{"--key-hex", "--file", "--tag-hex"},
+            opts)) {
+        return 2;
+    }
+    if (!requireOption(opts, "verify", kVerifyUsage, "--key-hex") ||
+        !requireOption(opts, "verify", kVerifyUsage, "--file") ||
+        !requireOption(opts, "verify", kVerifyUsage, "--tag-hex")) {
+        return 2;
+    }
+    const std::string& keyHex = opts["--key-hex"];
+    const std::string& filePath = opts["--file"];
+    const std::string& tagHex = opts["--tag-hex"];
+
+    // All input-format checks happen before the file is opened, so a
+    // malformed key or tag is reported as a parameter error (exit 2) even
+    // when the message file does not exist.
+    std::vector<unsigned char> key;
+    if (!parseKey("verify", kVerifyUsage, keyHex, key)) {
+        return 2;
+    }
+
+    // The supplied tag must decode to exactly 32 bytes (64 hex characters);
+    // decodeHex already rejects empty input, odd length, non-hex characters
+    // and whitespace, which also rules out a 0x prefix. The submitted tag is
+    // deliberately not echoed back.
+    std::vector<unsigned char> expected;
+    if (!decodeHex(tagHex, expected) || expected.size() != kTagBytes) {
+        std::cerr << "messagetag verify: error: invalid --tag-hex: expected "
+                     "exactly 64 hexadecimal characters denoting 32 bytes "
+                     "(0-9, a-f, A-F); empty, truncated or over-long values, "
+                     "embedded whitespace and a 0x prefix are not accepted\n"
+                  << kVerifyUsage;
+        return 2;
+    }
+
+    std::array<unsigned char, EVP_MAX_MD_SIZE> mac{};
+    std::size_t macLength = 0;
+    switch (hmacSha256File(key, filePath, mac, macLength)) {
+        case HmacStatus::kReadError:
+            // The partially read prefix must never be authenticated as if it
+            // were the whole message.
+            std::cerr << "messagetag verify: error: failed to read file: "
+                      << filePath << "\n";
+            return 1;
+        case HmacStatus::kCryptoError:
+            std::cerr << "messagetag verify: error: HMAC-SHA-256 "
+                         "computation failed\n";
+            return 1;
+        case HmacStatus::kSuccess:
+            break;
+    }
+
+    if (macLength != kTagBytes ||
+        !constantTimeEqual(mac.data(), expected.data(), kTagBytes)) {
+        // State only that authentication failed; do not assign a cause (the
+        // message, the key or the tag could each be the one that differs),
+        // and never print the recomputed tag, a matched prefix or the key.
+        std::cerr << "messagetag verify: error: authentication tag mismatch: "
+                     "the supplied tag does not match the given key and file "
+                     "content\n";
+        return 3;
+    }
+
+    std::cout << "OK\n";
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char* argv[]) {
@@ -209,7 +336,13 @@ int main(int argc, char* argv[]) {
     if (argc >= 2 && std::string_view(argv[1]) == "tag") {
         return runTag(argc, argv);
     }
+    if (argc >= 2 && std::string_view(argv[1]) == "verify") {
+        return runVerify(argc, argv);
+    }
     std::cerr << "Usage: messagetag --version\n"
-              << "       messagetag tag --key-hex <hex-key> --file <message-file>\n";
+              << "       messagetag tag --key-hex <hex-key> "
+                 "--file <message-file>\n"
+              << "       messagetag verify --key-hex <hex-key> "
+                 "--file <message-file> --tag-hex <hex-tag>\n";
     return 2;
 }

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Automatic regression tests for the documented ``messagetag tag`` contract.
+"""Automatic regression tests for the documented ``messagetag`` contract.
 
 The point of these tests is to make any small change in *file reading* or in
 *key interpretation* visibly break something. Expected tags therefore never
@@ -25,7 +25,15 @@ Two file-reading end conditions get dedicated coverage:
 - A read error after a non-empty prefix has already been read, injected
   with the LD_PRELOAD shim in tests/read_fault_shim.cpp (built by CMake,
   or compiled on the fly as a fallback): the run must exit 1 with empty
-  stdout and a read-error message, never a partial-message tag.
+  stdout and a read-error message, never a partial-message result. Both
+  ``tag`` and ``verify`` are checked this way.
+
+The ``verify`` suite additionally pins: success prints exactly ``OK\\n``;
+a tag that fails to authenticate gives exit 3 with empty stdout and a
+diagnostic that neither names a cause nor leaks the recomputed tag, a
+matching prefix or the key; the supplied tag must be exactly 64 hex
+characters (the ``tag`` output with its trailing newline removed, no new
+encapsulation); and parameter format is checked before the file is opened.
 
 Usage:
 
@@ -175,6 +183,40 @@ def expected_hmac(key_hex, message):
                        hashlib.sha256).hexdigest()
 
 
+def find_read_fault_shim(shim_path, exe, tmpdir):
+    """Locate (or, as a fallback, build) the LD_PRELOAD read-fault shim
+    used to exercise "open succeeded, partial content read, then the read
+    failed". Returns None when no shim is available; the caller then skips
+    loudly instead of silently losing coverage. Shared by the tag and
+    verify suites so both commands prove they refuse to produce a result
+    from a partially read message."""
+    candidates = []
+    if shim_path:
+        candidates.append(shim_path)
+    exe_dir = os.path.dirname(exe)
+    candidates += [
+        os.path.join(exe_dir, "libread_fault_shim.so"),
+        os.path.join(exe_dir, "read_fault_shim.so"),
+    ]
+    for path in candidates:
+        if os.path.isfile(path):
+            return path
+    # Direct invocation without a CMake build of the shim: compile it
+    # from next to this script if a C++ compiler is available.
+    src = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                       "read_fault_shim.cpp")
+    compiler = shutil.which("c++") or shutil.which("g++") \
+        or shutil.which("clang++")
+    if os.path.isfile(src) and compiler:
+        out = os.path.join(tmpdir, "libread_fault_shim.so")
+        built = subprocess.run(
+            [compiler, "-shared", "-fPIC", "-O2", "-o", out, src,
+             "-ldl"], capture_output=True)
+        if built.returncode == 0 and os.path.isfile(out):
+            return out
+    return None
+
+
 class TagRegression(unittest.TestCase):
     exe = None
     tmpdir = None
@@ -207,34 +249,7 @@ class TagRegression(unittest.TestCase):
 
     @classmethod
     def _find_read_fault_shim(cls):
-        """Locate (or, as a fallback, build) the LD_PRELOAD read-fault
-        shim used by test_34. Returns None when no shim is available; the
-        test then skips loudly instead of silently losing coverage."""
-        candidates = []
-        if cls.shim_path:
-            candidates.append(cls.shim_path)
-        exe_dir = os.path.dirname(cls.exe)
-        candidates += [
-            os.path.join(exe_dir, "libread_fault_shim.so"),
-            os.path.join(exe_dir, "read_fault_shim.so"),
-        ]
-        for path in candidates:
-            if os.path.isfile(path):
-                return path
-        # Direct invocation without a CMake build of the shim: compile it
-        # from next to this script if a C++ compiler is available.
-        src = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                           "read_fault_shim.cpp")
-        compiler = shutil.which("c++") or shutil.which("g++") \
-            or shutil.which("clang++")
-        if os.path.isfile(src) and compiler:
-            out = os.path.join(cls.tmpdir, "libread_fault_shim.so")
-            built = subprocess.run(
-                [compiler, "-shared", "-fPIC", "-O2", "-o", out, src,
-                 "-ldl"], capture_output=True)
-            if built.returncode == 0 and os.path.isfile(out):
-                return out
-        return None
+        return find_read_fault_shim(cls.shim_path, cls.exe, cls.tmpdir)
 
     @classmethod
     def tearDownClass(cls):
@@ -601,6 +616,380 @@ class TagRegression(unittest.TestCase):
         self.assertEqual(r.stdout, b"")
 
 
+class VerifyRegression(unittest.TestCase):
+    """Contract for ``messagetag verify``.
+
+    Expected tags are the independently computed constants already used by
+    the tag suite (re-derived from Python's hmac in TagRegression.test_00);
+    verify never learns the "right answer" from the program under test.
+    """
+
+    exe = None
+    tmpdir = None
+    shim_path = None
+    shim = None
+
+    # (label, key hex, fixture name, expected tag) -- a spread across empty
+    # messages, NUL bytes, trailing newlines, hex-case keys and large files.
+    CASES = [
+        ("empty",      "0b" * 20, "empty",
+         "999a901219f032cd497cadb5e6051e97b6a29ab297bd6ae722bd6062a2f59542"),
+        ("hello_lf",   "0001", "hello_lf",
+         "307a25cbcb6cbca48f5dd2b05fd9174c0cf17580f4ea8dd667092f11a77b4d5d"),
+        ("hello",      "0001", "hello",
+         "ee44e44a606a62df24b198d7130faa42a53e2aa5db4133210fd7c657aa7bb6ab"),
+        ("nul",        "0001", "nul",
+         "50da50e788e0ecda4126d1ac5752a88c0ab5fc4ce1dda87cb7d32fa34fd5c5f6"),
+        ("large",      LARGE_KEY_HEX, "large",
+         "d524cb7fca18676b75e28f2bb79b9a80718ecc589328bc2288192439f3e090d7"),
+        ("block2",     LARGE_KEY_HEX, "block2",
+         "f6f09c1fe5588e2f7c0196783cbe145c1f4f2fbeba87b156816cda9f90f6e154"),
+        ("upperkey",   "DEADBEEF", "hello",
+         "297a715da8a2b93f287fd5e6e7d4764bc3e899df7556d58889a4f986656c8009"),
+    ]
+
+    @classmethod
+    def setUpClass(cls):
+        if not cls.exe or not os.path.isfile(cls.exe):
+            raise RuntimeError("messagetag executable not found: %r" % cls.exe)
+        cls.tmpdir = tempfile.mkdtemp(prefix="messagetag-verify-")
+        fixtures = {}
+        for name, _key, message, _tag in PROJECT_VECTORS:
+            fixtures.setdefault(name, message)
+        for rel, data in fixtures.items():
+            path = os.path.join(cls.tmpdir, rel + ".bin")
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "wb") as f:
+                f.write(data)
+        os.makedirs(os.path.join(cls.tmpdir, "sub"), exist_ok=True)
+        with open(os.path.join(cls.tmpdir, "sub", "copy.bin"), "wb") as f:
+            f.write(b"hello\n")
+        cls.fixtures = fixtures
+        cls.shim = find_read_fault_shim(cls.shim_path, cls.exe, cls.tmpdir)
+
+    @classmethod
+    def tearDownClass(cls):
+        if cls.tmpdir and os.path.isdir(cls.tmpdir):
+            shutil.rmtree(cls.tmpdir, ignore_errors=True)
+
+    # -- helpers ------------------------------------------------------------
+
+    def fixture(self, name):
+        return os.path.join(self.tmpdir, name + ".bin")
+
+    def run_verify(self, key_hex, path, tag_hex, *extra):
+        return subprocess.run(
+            [self.exe, "verify", "--key-hex", key_hex, "--file", path,
+             "--tag-hex", tag_hex, *extra],
+            capture_output=True)
+
+    def assertVerifyOk(self, result, label=""):
+        self.assertEqual(
+            result.returncode, 0,
+            f"{label}: expected exit 0, got {result.returncode}; "
+            f"stderr={result.stderr!r}")
+        self.assertEqual(result.stdout, b"OK\n",
+                         f"{label}: stdout must be exactly b'OK\\n', got "
+                         f"{result.stdout!r}")
+        self.assertEqual(result.stderr, b"",
+                         f"{label}: stderr must be empty, got "
+                         f"{result.stderr!r}")
+
+    def assertMismatch(self, result, label=""):
+        self.assertEqual(
+            result.returncode, 3,
+            f"{label}: expected exit 3, got {result.returncode}; "
+            f"stdout={result.stdout!r} stderr={result.stderr!r}")
+        self.assertEqual(result.stdout, b"",
+                         f"{label}: stdout must carry no bytes on mismatch, "
+                         f"got {result.stdout!r}")
+        self.assertNotEqual(result.stderr, b"",
+                            f"{label}: a mismatch diagnostic is required")
+        lower = result.stderr.lower()
+        self.assertIn(b"mismatch", lower,
+                      f"{label}: diagnostic must state the mismatch")
+        # The diagnostic must not assign a definite cause: a mismatch can
+        # equally come from an altered message or a different key.
+        for forbidden in (b"wrong key", b"bad key", b"incorrect key",
+                          b"tamper", b"modif", b"corrupt"):
+            self.assertNotIn(forbidden, lower,
+                             f"{label}: diagnostic must not claim a specific "
+                             f"cause ({forbidden!r})")
+
+    def assertNoSecretLeak(self, result, tag_hex, key_hex, label=""):
+        # Never print a tag-length hex run in any casing, the supplied tag
+        # itself, or the key material.
+        self.assertNotRegex(result.stderr, rb"(?i)[0-9a-f]{64}",
+                            f"{label}: stderr must not contain a tag-length "
+                            f"hex string")
+        self.assertNotIn(tag_hex.lower().encode(), result.stderr.lower(),
+                         f"{label}: the supplied tag must not be echoed")
+        if len(key_hex) >= 4:
+            self.assertNotIn(key_hex.encode(), result.stderr,
+                             f"{label}: key material must not be echoed")
+
+    def assertUsageError(self, result, label=""):
+        self.assertEqual(
+            result.returncode, 2,
+            f"{label}: expected exit 2, got {result.returncode}; "
+            f"stderr={result.stderr!r}")
+        self.assertEqual(result.stdout, b"",
+                         f"{label}: stdout must be empty, got "
+                         f"{result.stdout!r}")
+        self.assertIn(b"Usage: messagetag verify", result.stderr,
+                      f"{label}: stderr must give the verify usage")
+
+    # -- success ------------------------------------------------------------
+
+    def test_50_success_is_exactly_ok_newline(self):
+        for label, key, name, tag in self.CASES:
+            with self.subTest(case=label):
+                self.assertVerifyOk(
+                    self.run_verify(key, self.fixture(name), tag), label)
+
+    def test_51_accepts_tag_command_output_with_newline_removed(self):
+        """The tag consumed by verify is exactly what ``messagetag tag``
+        prints with the trailing newline stripped -- no new wrapping."""
+        for label, key, name, _tag in self.CASES[:4]:
+            with self.subTest(case=label):
+                tagged = subprocess.run(
+                    [self.exe, "tag", "--key-hex", key,
+                     "--file", self.fixture(name)], capture_output=True)
+                self.assertEqual(tagged.returncode, 0)
+                self.assertTrue(tagged.stdout.endswith(b"\n"))
+                # Pass through the raw bytes of the tag line; verify itself
+                # rejects whitespace, so stripping is the contract, not
+                # implicit trimming.
+                supplied = tagged.stdout[:-1].decode()
+                self.assertVerifyOk(
+                    self.run_verify(key, self.fixture(name), supplied), label)
+
+    def test_52_tag_hex_case_insensitive(self):
+        tag = "307a25cbcb6cbca48f5dd2b05fd9174c0cf17580f4ea8dd667092f11a77b4d5d"
+        for variant in (tag, tag.upper(), "".join(
+                c.upper() if i % 2 == 0 else c for i, c in enumerate(tag))):
+            with self.subTest(variant=variant[:8]):
+                self.assertVerifyOk(
+                    self.run_verify("0001", self.fixture("hello_lf"),
+                                    variant))
+
+    def test_53_path_not_part_of_message(self):
+        tag = "307a25cbcb6cbca48f5dd2b05fd9174c0cf17580f4ea8dd667092f11a77b4d5d"
+        for path in (self.fixture("hello_lf"),
+                     os.path.join(self.tmpdir, "sub", "copy.bin")):
+            self.assertVerifyOk(
+                self.run_verify("0001", path, tag), path)
+
+    def test_54_option_order_interchangeable(self):
+        tag = "307a25cbcb6cbca48f5dd2b05fd9174c0cf17580f4ea8dd667092f11a77b4d5d"
+        path = self.fixture("hello_lf")
+        for argv in (
+            [self.exe, "verify", "--file", path, "--key-hex", "0001",
+             "--tag-hex", tag],
+            [self.exe, "verify", "--tag-hex", tag, "--file", path,
+             "--key-hex", "0001"],
+        ):
+            r = subprocess.run(argv, capture_output=True)
+            self.assertVerifyOk(r)
+
+    # -- authentication failure --------------------------------------------
+
+    def test_60_modified_message_mismatch(self):
+        # Tag authenticates hello_lf; every other fixture must fail,
+        # including one-byte neighbours (hello without newline, CR variant).
+        tag = "307a25cbcb6cbca48f5dd2b05fd9174c0cf17580f4ea8dd667092f11a77b4d5d"
+        for name in ("hello", "hello_cr", "hello_crlf", "nul", "empty"):
+            with self.subTest(fixture=name):
+                r = self.run_verify("0001", self.fixture(name), tag)
+                self.assertMismatch(r, name)
+                self.assertNoSecretLeak(r, tag, "0001", name)
+
+    def test_61_different_key_mismatch(self):
+        tag = "307a25cbcb6cbca48f5dd2b05fd9174c0cf17580f4ea8dd667092f11a77b4d5d"
+        for wrong_key in ("0002", "000001", "deadbeef", "0b" * 20):
+            with self.subTest(key=wrong_key):
+                r = self.run_verify(wrong_key, self.fixture("hello_lf"), tag)
+                self.assertMismatch(r, wrong_key)
+                self.assertNoSecretLeak(r, tag, wrong_key, wrong_key)
+
+    def test_62_flipped_tag_mismatch_at_every_position_class(self):
+        """Tags differing in the first byte, the last byte and a middle
+        byte all give the same plain mismatch result, regardless of how
+        long a prefix happens to match."""
+        tag = bytearray.fromhex(
+            "307a25cbcb6cbca48f5dd2b05fd9174c0cf17580f4ea8dd667092f11a77b4d5d")
+        for pos in (0, 15, 31):
+            flipped = tag.copy()
+            flipped[pos] ^= 0x01
+            supplied = flipped.hex()
+            with self.subTest(pos=pos):
+                r = self.run_verify("0001", self.fixture("hello_lf"),
+                                    supplied)
+                self.assertMismatch(r, f"pos {pos}")
+                self.assertNoSecretLeak(r, supplied, "0001", f"pos {pos}")
+
+    def test_63_trailing_newline_participates(self):
+        lf = "307a25cbcb6cbca48f5dd2b05fd9174c0cf17580f4ea8dd667092f11a77b4d5d"
+        no_lf = "ee44e44a606a62df24b198d7130faa42a53e2aa5db4133210fd7c657aa7bb6ab"
+        # Tag for "hello\n" must not verify the file without the newline...
+        self.assertMismatch(
+            self.run_verify("0001", self.fixture("hello"), lf))
+        # ...and the converse.
+        self.assertMismatch(
+            self.run_verify("0001", self.fixture("hello_lf"), no_lf))
+
+    def test_64_empty_vs_nonempty_distinguished(self):
+        empty_tag = expected_hmac("0001", b"")
+        r = self.run_verify("0001", self.fixture("hello"), empty_tag)
+        self.assertMismatch(r)
+
+    # -- tag format: parameter errors before any file access --------------
+
+    def test_70_tag_must_be_exactly_64_hex_chars(self):
+        good = "307a25cbcb6cbca48f5dd2b05fd9174c0cf17580f4ea8dd667092f11a77b4d5d"
+        bad = [
+            "",            # empty
+            good[:-1],     # 63 chars, truncated by one
+            good[:-2],     # 62 chars
+            good[:32],     # 32 chars (16 bytes)
+            good + "aa",   # over-long (33 bytes)
+            good + "0",    # 65 chars, odd
+            "0x" + good,   # 0x prefix
+            " " + good,    # leading whitespace
+            good + " ",    # trailing whitespace
+            good[:10] + " " + good[11:],  # embedded whitespace
+            good + "\n",   # the newline tag output ends with: must be stripped
+            good[:-1] + "g",  # non-hex character
+            "z" * 64,      # all non-hex but right length
+            good[:-1] + "G",  # G is not hex
+        ]
+        for supplied in bad:
+            with self.subTest(tag=repr(supplied)):
+                r = self.run_verify("0001", self.fixture("hello_lf"), supplied)
+                self.assertUsageError(r, repr(supplied))
+                # The malformed tag itself must not be echoed back.
+                if supplied:
+                    self.assertNotIn(supplied.encode(), r.stderr)
+
+    def test_71_bad_key_is_parameter_error(self):
+        good = "307a25cbcb6cbca48f5dd2b05fd9174c0cf17580f4ea8dd667092f11a77b4d5d"
+        for bad_key in ("", "abc", "0x01", "zz", "ab cd"):
+            with self.subTest(key=repr(bad_key)):
+                r = self.run_verify(bad_key, self.fixture("hello_lf"), good)
+                self.assertUsageError(r, repr(bad_key))
+
+    def test_72_format_checked_before_file_is_opened(self):
+        """An invalid key/tag is a parameter error even when the file does
+        not exist: input validation must precede reading."""
+        good = "307a25cbcb6cbca48f5dd2b05fd9174c0cf17580f4ea8dd667092f11a77b4d5d"
+        missing = os.path.join(self.tmpdir, "no-such-file.bin")
+        self.assertFalse(os.path.exists(missing))
+        # Malformed tag + missing file -> 2 (not 1, not 3).
+        self.assertUsageError(
+            self.run_verify("0001", missing, "abc"), "bad tag, missing file")
+        self.assertUsageError(
+            self.run_verify("0001", missing, ""), "empty tag, missing file")
+        self.assertUsageError(
+            self.run_verify("zz", missing, good), "bad key, missing file")
+        # Well-formed inputs against a missing file are a read failure (1).
+        r = self.run_verify("0001", missing, good)
+        self.assertEqual(r.returncode, 1)
+        self.assertEqual(r.stdout, b"")
+
+    def test_73_missing_valueless_and_unknown_options_exit_2(self):
+        path = self.fixture("hello_lf")
+        good = "307a25cbcb6cbca48f5dd2b05fd9174c0cf17580f4ea8dd667092f11a77b4d5d"
+        invocations = [
+            [self.exe, "verify"],
+            [self.exe, "verify", "--key-hex", "0001", "--file", path],
+            [self.exe, "verify", "--key-hex", "0001", "--tag-hex", good],
+            [self.exe, "verify", "--file", path, "--tag-hex", good],
+            [self.exe, "verify", "--key-hex", "0001", "--file", path,
+             "--tag-hex"],                       # option without a value
+            [self.exe, "verify", "--key-hex", "0001", "--file", path,
+             "--tag-hex", good, "--bogus", "x"],  # unknown argument
+            [self.exe, "verify", "--key-hex"],   # missing value, end of argv
+            [self.exe, "verify", "tag-hex", good, "--key-hex", "0001",
+             "--file", path],                    # looks like, but no dashes
+        ]
+        for argv in invocations:
+            with self.subTest(argv=argv[2:]):
+                r = subprocess.run(argv, capture_output=True)
+                self.assertUsageError(r, repr(argv))
+
+    # -- read / computation failures ---------------------------------------
+
+    def test_80_unopenable_file_exit_1(self):
+        good = "307a25cbcb6cbca48f5dd2b05fd9174c0cf17580f4ea8dd667092f11a77b4d5d"
+        missing = os.path.join(self.tmpdir, "does-not-exist.bin")
+        r = self.run_verify("0001", missing, good)
+        self.assertEqual(r.returncode, 1)
+        self.assertEqual(r.stdout, b"")
+        self.assertIn(b"read", r.stderr.lower())
+        self.assertNoSecretLeak(r, good, "0001", "missing file")
+
+        if os.geteuid() != 0:
+            locked = os.path.join(self.tmpdir, "locked.bin")
+            with open(locked, "w") as f:
+                f.write("data")
+            os.chmod(locked, 0)
+            try:
+                r = self.run_verify("0001", locked, good)
+                self.assertEqual(r.returncode, 1)
+                self.assertEqual(r.stdout, b"")
+                self.assertIn(b"read", r.stderr.lower())
+            finally:
+                os.chmod(locked, stat.S_IRUSR | stat.S_IWUSR)
+
+    def test_81_read_error_after_partial_read_is_exit_1(self):
+        """Open succeeds, a non-empty prefix is read, then a read fails.
+        Verification must end with exit 1 and empty stdout: it must neither
+        accept on the partial prefix nor report a mismatch (exit 3) as if
+        the whole file had been read. Injected with the LD_PRELOAD shim."""
+        if self.shim is None:
+            self.skipTest("read-fault shim not available (build with CMake "
+                          "or pass its path as the second argument)")
+        if not os.path.exists("/proc/self/fd"):
+            self.skipTest("read-fault shim needs /proc/self/fd (Linux)")
+
+        data = stream_bytes(READ_CHUNK + 5000)
+        path = os.path.join(self.tmpdir, "midread-verify.bin")
+        with open(path, "wb") as f:
+            f.write(data)
+        correct_tag = expected_hmac("0001", data)
+
+        env = dict(os.environ)
+        env["LD_PRELOAD"] = self.shim
+        env["MESSAGETAG_READ_FAULT_PATH"] = path
+        for fail_after in (1, 5000, READ_CHUNK, len(data) - 1):
+            with self.subTest(fail_after=fail_after):
+                env["MESSAGETAG_READ_FAULT_AFTER"] = str(fail_after)
+                # Correct tag for the WHOLE message: a verifier that
+                # finalized the readable prefix would exit 3, which is just
+                # as wrong as printing OK.
+                r = subprocess.run(
+                    [self.exe, "verify", "--key-hex", "0001",
+                     "--file", path, "--tag-hex", correct_tag],
+                    capture_output=True, env=env)
+                self.assertEqual(
+                    r.returncode, 1,
+                    f"fail_after={fail_after}: expected exit 1, got "
+                    f"{r.returncode}; stdout={r.stdout!r} "
+                    f"stderr={r.stderr!r}")
+                self.assertEqual(r.stdout, b"")
+                self.assertIn(b"read", r.stderr.lower())
+
+                # And a tag matching only the readable prefix must not turn
+                # the read failure into a successful verification either.
+                prefix_tag = expected_hmac("0001", data[:fail_after])
+                r2 = subprocess.run(
+                    [self.exe, "verify", "--key-hex", "0001",
+                     "--file", path, "--tag-hex", prefix_tag],
+                    capture_output=True, env=env)
+                self.assertEqual(r2.returncode, 1)
+                self.assertEqual(r2.stdout, b"")
+
+
 def main():
     if len(sys.argv) not in (2, 3):
         print("usage: regression_test.py /path/to/messagetag "
@@ -610,9 +999,16 @@ def main():
     TagRegression.tmpdir = None
     TagRegression.shim_path = (os.path.abspath(sys.argv[2])
                                if len(sys.argv) == 3 else None)
+    VerifyRegression.exe = TagRegression.exe
+    VerifyRegression.tmpdir = None
+    VerifyRegression.shim_path = TagRegression.shim_path
     argv = [sys.argv[0], "-v"]
     # unittest's TextTestRunner gives non-zero exit when a test fails.
-    suite = unittest.defaultTestLoader.loadTestsFromTestCase(TagRegression)
+    loader = unittest.defaultTestLoader
+    suite = unittest.TestSuite([
+        loader.loadTestsFromTestCase(TagRegression),
+        loader.loadTestsFromTestCase(VerifyRegression),
+    ])
     result = unittest.TextTestRunner(verbosity=2).run(suite)
     return 0 if result.wasSuccessful() else 1
 
