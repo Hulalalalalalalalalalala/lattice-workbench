@@ -15,9 +15,22 @@ bases:
    fixture recipe can no longer be silently altered to match a broken
    implementation.
 
+Two file-reading end conditions get dedicated coverage:
+
+- Messages of exactly N * 65536 bytes (the read chunk size): the trailing
+  zero-byte read at EOF is normal termination, and the tag must match the
+  independently computed HMAC of every byte, so neither dropping nor
+  doubling the final chunk -- nor reporting the clean end as a failure --
+  can pass.
+- A read error after a non-empty prefix has already been read, injected
+  with the LD_PRELOAD shim in tests/read_fault_shim.cpp (built by CMake,
+  or compiled on the fly as a fallback): the run must exit 1 with empty
+  stdout and a read-error message, never a partial-message tag.
+
 Usage:
 
-    python3 tests/regression_test.py /path/to/messagetag
+    python3 tests/regression_test.py /path/to/messagetag \
+        [/path/to/libread_fault_shim.so]
 """
 
 import hashlib
@@ -38,12 +51,21 @@ import unittest
 LARGE_LEN = 2 * 65536 + 123          # > 64 KiB and not a multiple of 64 KiB
 LARGE_KEY_HEX = "0123456789abcdef" * 4   # 32-byte key
 
+READ_CHUNK = 65536                   # the program's documented read chunk
+
 
 def large_bytes():
     """131195 bytes whose value depends on every position: two whole 64 KiB
     read chunks plus a 123-byte tail. Dropping, repeating or reordering any
     byte changes the tag."""
     return bytes((i * 31 + 7) % 256 for i in range(LARGE_LEN))
+
+
+def stream_bytes(n):
+    """First n bytes of a position-dependent byte stream (distinct recipe
+    from large_bytes). Used for messages whose length is an exact multiple
+    of the 64 KiB read chunk, plus one-byte-off neighbours."""
+    return bytes((i * 17 + 5) % 256 for i in range(n))
 
 
 # ---------------------------------------------------------------------------
@@ -126,6 +148,25 @@ PROJECT_VECTORS.append(
     ("large_mid", LARGE_KEY_HEX, bytes(_mid_msg),
      "4b27ce3500f1809311e794fd10e2e4afc4278ebd11435835746a13f7fb41aa2f"))
 
+# Messages whose length is an exact multiple of the 64 KiB read chunk: the
+# final read returns 0 bytes at EOF, which is normal termination, not a
+# read failure, and the last full chunk must be authenticated exactly once
+# (neither dropped nor fed twice). The one-byte-off neighbours pin the
+# boundary from both sides. All tags computed independently with Python's
+# hmac/hashlib and re-derived at runtime by test_00.
+PROJECT_VECTORS += [
+    ("block1",       LARGE_KEY_HEX, stream_bytes(1 * READ_CHUNK),
+     "1a7f32684b691064982eb67a0c0d175f11a13d95f8e75185f425c7d7a2b77d66"),
+    ("block2",       LARGE_KEY_HEX, stream_bytes(2 * READ_CHUNK),
+     "f6f09c1fe5588e2f7c0196783cbe145c1f4f2fbeba87b156816cda9f90f6e154"),
+    ("block3",       LARGE_KEY_HEX, stream_bytes(3 * READ_CHUNK),
+     "2ee751a6f10074ad024989f42bd8f08bcbf90447226503731f194923344891da"),
+    ("block1_minus", LARGE_KEY_HEX, stream_bytes(READ_CHUNK - 1),
+     "8d20c29e4606cd0d0aa115b507c7ebb9912354ec44d6793b2a4112237cdb8c0e"),
+    ("block1_plus",  LARGE_KEY_HEX, stream_bytes(READ_CHUNK + 1),
+     "df45b0a2bfba857c7aaee155f1f5677d2e506b6f008774caf3e5d88f940ec9cf"),
+]
+
 TAG_RE = re.compile(rb"\A[0-9a-f]{64}\n\Z")
 
 
@@ -137,6 +178,8 @@ def expected_hmac(key_hex, message):
 class TagRegression(unittest.TestCase):
     exe = None
     tmpdir = None
+    shim_path = None   # optional second CLI argument: read-fault shim
+    shim = None
 
     @classmethod
     def setUpClass(cls):
@@ -160,6 +203,38 @@ class TagRegression(unittest.TestCase):
                   "wb") as f:
             f.write(b"hello\n")
         cls.fixtures = fixtures
+        cls.shim = cls._find_read_fault_shim()
+
+    @classmethod
+    def _find_read_fault_shim(cls):
+        """Locate (or, as a fallback, build) the LD_PRELOAD read-fault
+        shim used by test_34. Returns None when no shim is available; the
+        test then skips loudly instead of silently losing coverage."""
+        candidates = []
+        if cls.shim_path:
+            candidates.append(cls.shim_path)
+        exe_dir = os.path.dirname(cls.exe)
+        candidates += [
+            os.path.join(exe_dir, "libread_fault_shim.so"),
+            os.path.join(exe_dir, "read_fault_shim.so"),
+        ]
+        for path in candidates:
+            if os.path.isfile(path):
+                return path
+        # Direct invocation without a CMake build of the shim: compile it
+        # from next to this script if a C++ compiler is available.
+        src = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "read_fault_shim.cpp")
+        compiler = shutil.which("c++") or shutil.which("g++") \
+            or shutil.which("clang++")
+        if os.path.isfile(src) and compiler:
+            out = os.path.join(cls.tmpdir, "libread_fault_shim.so")
+            built = subprocess.run(
+                [compiler, "-shared", "-fPIC", "-O2", "-o", out, src,
+                 "-ldl"], capture_output=True)
+            if built.returncode == 0 and os.path.isfile(out):
+                return out
+        return None
 
     @classmethod
     def tearDownClass(cls):
@@ -287,6 +362,40 @@ class TagRegression(unittest.TestCase):
         self.assertEqual(a.stdout, b.stdout)
         self.assertEqual(a.stdout, c.stdout)
 
+    def test_17_exact_chunk_multiple_is_normal_eof(self):
+        """A message of exactly N * 65536 bytes ends with a read that
+        returns 0 bytes. That is normal termination, not a read failure:
+        the exit code must be 0 and the tag must cover every byte of every
+        chunk exactly once. The expected tags are the independently
+        computed constants in PROJECT_VECTORS (re-derived via the stdlib
+        in test_00), so duplicating or dropping the final chunk -- or
+        reporting the clean end as an error -- fails here."""
+        expected = {name: tag for name, _key, _msg, tag in PROJECT_VECTORS}
+        tags = {}
+        for name in ("block1", "block2", "block3"):
+            with self.subTest(fixture=name):
+                result = self.run_tag(LARGE_KEY_HEX, self.fixture(name))
+                self.assertTagSuccess(result, expected[name], name)
+                tags[name] = result.stdout
+        # Distinct lengths must give distinct tags; in particular the
+        # 2-chunk and 3-chunk tags must not equal the 1-chunk tag (which
+        # is what a dropped or short-circuited tail would produce).
+        self.assertEqual(len(set(tags.values())), 3)
+        # The one-byte-off neighbours pin the boundary itself: the last
+        # byte of the chunk participates, and no phantom 65537th byte is
+        # read past the end.
+        for name in ("block1_minus", "block1_plus"):
+            with self.subTest(fixture=name):
+                self.assertTagSuccess(
+                    self.run_tag(LARGE_KEY_HEX, self.fixture(name)),
+                    expected[name], name)
+        self.assertNotEqual(tags["block1"],
+                            self.run_tag(LARGE_KEY_HEX,
+                                         self.fixture("block1_minus")).stdout)
+        self.assertNotEqual(tags["block1"],
+                            self.run_tag(LARGE_KEY_HEX,
+                                         self.fixture("block1_plus")).stdout)
+
     # -- key interpretation -------------------------------------------------
 
     def test_20_hex_case_insensitive(self):
@@ -412,6 +521,72 @@ class TagRegression(unittest.TestCase):
             finally:
                 os.chmod(locked, stat.S_IRUSR | stat.S_IWUSR)
 
+    def test_34_read_error_after_partial_read(self):
+        """The file opens fine and a non-empty prefix is read, then a read
+        fails mid-message. The whole operation must fail with exit code 1,
+        no bytes on stdout and a read-error message on stderr -- even
+        though the prefix already read would authenticate to a perfectly
+        valid tag. Finalizing the partial message (treating the failure as
+        normal EOF) or reporting it as a key/usage error (exit 2) both
+        fail here.
+
+        The failure is injected with an LD_PRELOAD shim that makes read(2)
+        fail with EIO after a chosen number of bytes of the message file;
+        it does not depend on file permissions or on special files."""
+        if self.shim is None:
+            self.skipTest("read-fault shim not available (build with CMake "
+                          "or pass its path as the second argument)")
+        if not os.path.exists("/proc/self/fd"):
+            self.skipTest("read-fault shim needs /proc/self/fd (Linux)")
+
+        data = stream_bytes(READ_CHUNK + 5000)   # > one chunk, ragged tail
+        path = os.path.join(self.tmpdir, "midread.bin")
+        with open(path, "wb") as f:
+            f.write(data)
+
+        def run_injected(fail_after, target=path):
+            env = dict(os.environ)
+            env["LD_PRELOAD"] = self.shim
+            env["MESSAGETAG_READ_FAULT_PATH"] = target
+            env["MESSAGETAG_READ_FAULT_AFTER"] = str(fail_after)
+            return subprocess.run(
+                [self.exe, "tag", "--key-hex", "0001", "--file", path],
+                capture_output=True, env=env)
+
+        # Control: shim loaded but aimed at a different path must not
+        # disturb a normal run -- the full message authenticates exactly.
+        # This also proves the shim is actually loaded for the runs below.
+        control = run_injected(1, target=path + ".not-the-target")
+        self.assertTagSuccess(control, expected_hmac("0001", data),
+                              "shim control run")
+
+        # Fail after a non-empty prefix at several offsets: inside the
+        # first chunk, exactly at the chunk boundary, inside the second
+        # chunk, and one byte before the real end of the file.
+        for fail_after in (1, 5000, READ_CHUNK, READ_CHUNK + 1234,
+                           len(data) - 1):
+            with self.subTest(fail_after=fail_after):
+                # The prefix alone is a valid message with a valid tag;
+                # that tag must NOT be produced.
+                prefix_tag = expected_hmac("0001", data[:fail_after])
+                result = run_injected(fail_after)
+                self.assertEqual(
+                    result.returncode, 1,
+                    f"fail_after={fail_after}: expected exit 1, got "
+                    f"{result.returncode}; stdout={result.stdout!r} "
+                    f"stderr={result.stderr!r}")
+                self.assertEqual(
+                    result.stdout, b"",
+                    f"fail_after={fail_after}: no tag may be printed for "
+                    f"a partially read message (prefix tag would be "
+                    f"{prefix_tag})")
+                self.assertNotEqual(
+                    result.stderr, b"",
+                    f"fail_after={fail_after}: a read failure must be "
+                    f"reported on stderr")
+                self.assertIn(b"read", result.stderr.lower())
+                self.assertNotRegex(result.stderr, rb"[0-9a-f]{64}")
+
     # -- entry-point compatibility -----------------------------------------
 
     def test_40_version_entry_point(self):
@@ -427,11 +602,14 @@ class TagRegression(unittest.TestCase):
 
 
 def main():
-    if len(sys.argv) != 2:
-        print("usage: regression_test.py /path/to/messagetag", file=sys.stderr)
+    if len(sys.argv) not in (2, 3):
+        print("usage: regression_test.py /path/to/messagetag "
+              "[/path/to/libread_fault_shim.so]", file=sys.stderr)
         return 2
     TagRegression.exe = os.path.abspath(sys.argv[1])
     TagRegression.tmpdir = None
+    TagRegression.shim_path = (os.path.abspath(sys.argv[2])
+                               if len(sys.argv) == 3 else None)
     argv = [sys.argv[0], "-v"]
     # unittest's TextTestRunner gives non-zero exit when a test fails.
     suite = unittest.defaultTestLoader.loadTestsFromTestCase(TagRegression)
