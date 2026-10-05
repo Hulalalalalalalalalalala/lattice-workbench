@@ -251,6 +251,47 @@ class TagRegression(unittest.TestCase):
             [self.exe, "tag", "--key-hex", key_hex, "--file", path, *extra],
             capture_output=True)
 
+    def run_verify(self, key_hex, path, tag_hex, *extra):
+        return subprocess.run(
+            [self.exe, "verify", "--key-hex", key_hex, "--file", path,
+             "--tag-hex", tag_hex, *extra],
+            capture_output=True)
+
+    def assertVerifyOk(self, result, label=""):
+        self.assertEqual(
+            result.returncode, 0,
+            f"{label}: expected exit 0, got {result.returncode}; "
+            f"stderr={result.stderr!r}")
+        self.assertEqual(result.stdout, b"OK\n",
+                         f"{label}: stdout must be exactly 'OK\\n', got "
+                         f"{result.stdout!r}")
+        self.assertEqual(result.stderr, b"",
+                         f"{label}: stderr must be empty, got {result.stderr!r}")
+
+    def assertVerifyMismatch(self, result, key_hex, tag_hex, label=""):
+        """Exit 3, empty stdout, and a stderr message that states the
+        mismatch without leaking anything: not the recomputed tag, not any
+        64-hex-looking string, and not the submitted key."""
+        self.assertEqual(
+            result.returncode, 3,
+            f"{label}: expected exit 3, got {result.returncode}; "
+            f"stdout={result.stdout!r} stderr={result.stderr!r}")
+        self.assertEqual(result.stdout, b"",
+                         f"{label}: stdout must be empty on mismatch")
+        self.assertNotEqual(result.stderr, b"",
+                            f"{label}: mismatch must be reported on stderr")
+        self.assertIn(b"not match", result.stderr.lower(),
+                      f"{label}: stderr must say the tag does not match")
+        self.assertNotRegex(
+            result.stderr, rb"[0-9a-fA-F]{64}",
+            f"{label}: stderr must not contain any tag (recomputed, "
+            f"submitted, or a matching prefix)")
+        if len(key_hex) >= 8:
+            # Only checked for distinctive keys: a very short key string can
+            # collide with ordinary words in the fixed message.
+            self.assertNotIn(key_hex.encode(), result.stderr,
+                             f"{label}: the key must not be echoed")
+
     def assertTagSuccess(self, result, expected_tag, label=""):
         self.assertEqual(
             result.returncode, 0,
@@ -586,6 +627,192 @@ class TagRegression(unittest.TestCase):
                     f"reported on stderr")
                 self.assertIn(b"read", result.stderr.lower())
                 self.assertNotRegex(result.stderr, rb"[0-9a-f]{64}")
+
+    # -- verify subcommand --------------------------------------------------
+
+    def test_50_verify_ok_for_all_vectors(self):
+        """Every pinned tag verifies against its own fixture: exit 0, stdout
+        exactly 'OK\\n', empty stderr."""
+        for name, key, _message, tag in PROJECT_VECTORS:
+            with self.subTest(fixture=name):
+                self.assertVerifyOk(
+                    self.run_verify(key, self.fixture(name), tag), name)
+
+    def test_51_verify_accepts_either_hex_case(self):
+        tag = "307a25cbcb6cbca48f5dd2b05fd9174c0cf17580f4ea8dd667092f11a77b4d5d"
+        self.assertVerifyOk(
+            self.run_verify("0001", self.fixture("hello_lf"), tag.upper()),
+            "uppercase tag")
+        mixed = "".join(c.upper() if i % 2 else c for i, c in enumerate(tag))
+        self.assertVerifyOk(
+            self.run_verify("0001", self.fixture("hello_lf"), mixed),
+            "mixed-case tag")
+
+    def test_52_verify_mismatch_exit_3(self):
+        """A well-formed tag that does not authenticate gives exit 3, empty
+        stdout and a leak-free stderr message -- whether the message was
+        changed, the key was changed, or the tag itself was altered."""
+        tag = "307a25cbcb6cbca48f5dd2b05fd9174c0cf17580f4ea8dd667092f11a77b4d5d"
+        # Same key, different message (no trailing newline).
+        self.assertVerifyMismatch(
+            self.run_verify("0001", self.fixture("hello"), tag),
+            "0001", tag, "message changed")
+        # Same message, different key.
+        self.assertVerifyMismatch(
+            self.run_verify(LARGE_KEY_HEX, self.fixture("hello_lf"), tag),
+            LARGE_KEY_HEX, tag, "key changed")
+        # Same message and key, tag altered in the last hex digit.
+        altered = tag[:-1] + ("0" if tag[-1] != "0" else "1")
+        self.assertVerifyMismatch(
+            self.run_verify("0001", self.fixture("hello_lf"), altered),
+            "0001", altered, "tag altered")
+        # Tag altered in the FIRST hex digit: a comparison that stops at the
+        # first difference still has to report a plain mismatch.
+        altered0 = ("1" if tag[0] != "1" else "2") + tag[1:]
+        self.assertVerifyMismatch(
+            self.run_verify("0001", self.fixture("hello_lf"), altered0),
+            "0001", altered0, "tag altered at first digit")
+        # Empty file with a tag that does not belong to it.
+        self.assertVerifyMismatch(
+            self.run_verify("0b" * 20, self.fixture("empty"), tag),
+            "0b" * 20, tag, "empty message, foreign tag")
+
+    def test_53_verify_invalid_tag_exit_2(self):
+        """The tag must be exactly 64 hex characters: empty, truncated,
+        over-long, non-hex, whitespace-bearing and 0x-prefixed values are
+        all usage errors (exit 2, empty stdout, reason plus verify usage on
+        stderr)."""
+        good = "307a25cbcb6cbca48f5dd2b05fd9174c0cf17580f4ea8dd667092f11a77b4d5d"
+        bad_tags = [
+            "",                 # empty
+            good[:63],          # truncated
+            good + "0",         # over-long
+            good[:62],          # far too short
+            "zz" + good[2:],    # non-hex characters
+            "0x" + good,        # 0x prefix
+            good[:32] + " " + good[32:],   # embedded whitespace
+            good + "\n",        # trailing newline is not part of the tag
+            " " + good,         # leading whitespace
+            good[:-1] + "g",    # non-hex at the very end
+        ]
+        for bad in bad_tags:
+            with self.subTest(tag=bad):
+                r = self.run_verify("0001", self.fixture("hello_lf"), bad)
+                self.assertEqual(r.returncode, 2,
+                                 f"tag {bad!r}: expected exit 2, got "
+                                 f"{r.returncode}")
+                self.assertEqual(r.stdout, b"",
+                                 f"tag {bad!r}: stdout must be empty")
+                self.assertIn(b"--tag-hex", r.stderr,
+                              f"tag {bad!r}: stderr must show verify usage")
+                self.assertNotRegex(r.stderr, rb"[0-9a-fA-F]{64}",
+                                    f"tag {bad!r}: stderr must not contain "
+                                    f"a tag")
+
+    def test_54_verify_tag_format_checked_before_file(self):
+        """Input formats are validated before the file is read: an invalid
+        tag is a usage error even when the message file does not exist --
+        never exit 1 (read) or 3 (mismatch)."""
+        missing = os.path.join(self.tmpdir, "does-not-exist.bin")
+        r = self.run_verify("0001", missing, "abc")
+        self.assertEqual(r.returncode, 2)
+        self.assertEqual(r.stdout, b"")
+        self.assertIn(b"--tag-hex", r.stderr)
+        # An invalid key is likewise reported before any file access.
+        r = self.run_verify("xyz", missing,
+                            "307a25cbcb6cbca48f5dd2b05fd9174c"
+                            "0cf17580f4ea8dd667092f11a77b4d5d")
+        self.assertEqual(r.returncode, 2)
+        self.assertEqual(r.stdout, b"")
+        # With valid formats, the missing file is a read failure (exit 1).
+        r = self.run_verify("0001", missing,
+                            "307a25cbcb6cbca48f5dd2b05fd9174c"
+                            "0cf17580f4ea8dd667092f11a77b4d5d")
+        self.assertEqual(r.returncode, 1)
+        self.assertEqual(r.stdout, b"")
+        self.assertIn(b"read", r.stderr.lower())
+
+    def test_55_verify_argument_errors_exit_2(self):
+        good = "307a25cbcb6cbca48f5dd2b05fd9174c0cf17580f4ea8dd667092f11a77b4d5d"
+        path = self.fixture("hello_lf")
+        cases = [
+            ["verify"],
+            ["verify", "--key-hex", "0001", "--file", path],      # no tag
+            ["verify", "--key-hex", "0001", "--tag-hex", good],   # no file
+            ["verify", "--file", path, "--tag-hex", good],        # no key
+            ["verify", "--key-hex", "0001", "--file", path,
+             "--tag-hex", good, "--bogus", "x"],                  # unknown
+            ["verify", "--key-hex"],                              # no value
+            ["verify", "--key-hex", "0001", "--file", path, "--tag-hex"],
+        ]
+        for argv in cases:
+            with self.subTest(argv=argv):
+                r = subprocess.run([self.exe, *argv], capture_output=True)
+                self.assertEqual(r.returncode, 2,
+                                 f"{argv}: expected exit 2, got "
+                                 f"{r.returncode}")
+                self.assertEqual(r.stdout, b"")
+                self.assertIn(b"verify", r.stderr,
+                              f"{argv}: stderr must name the verify command")
+
+    def test_56_verify_unopenable_file_exit_1(self):
+        missing = os.path.join(self.tmpdir, "does-not-exist.bin")
+        r = self.run_verify("0001", missing,
+                            "307a25cbcb6cbca48f5dd2b05fd9174c"
+                            "0cf17580f4ea8dd667092f11a77b4d5d")
+        self.assertEqual(r.returncode, 1)
+        self.assertEqual(r.stdout, b"",
+                         "a read failure must not print OK or a tag")
+        self.assertIn(b"read", r.stderr.lower())
+        self.assertNotRegex(r.stderr, rb"[0-9a-fA-F]{64}")
+
+    def test_57_verify_read_error_after_partial_read(self):
+        """Same injected mid-read failure as test_34, but for verify: the
+        run must exit 1 with empty stdout -- never 'OK' from a partially
+        read message, and never a mismatch verdict either."""
+        if self.shim is None:
+            self.skipTest("read-fault shim not available (build with CMake "
+                          "or pass its path as the second argument)")
+        if not os.path.exists("/proc/self/fd"):
+            self.skipTest("read-fault shim needs /proc/self/fd (Linux)")
+
+        data = stream_bytes(READ_CHUNK + 5000)
+        path = os.path.join(self.tmpdir, "midread-verify.bin")
+        with open(path, "wb") as f:
+            f.write(data)
+        tag = expected_hmac("0001", data)
+
+        def run_injected(fail_after, target=path):
+            env = dict(os.environ)
+            env["LD_PRELOAD"] = self.shim
+            env["MESSAGETAG_READ_FAULT_PATH"] = target
+            env["MESSAGETAG_READ_FAULT_AFTER"] = str(fail_after)
+            return subprocess.run(
+                [self.exe, "verify", "--key-hex", "0001", "--file", path,
+                 "--tag-hex", tag],
+                capture_output=True, env=env)
+
+        # Control: shim aimed elsewhere must not disturb a normal verify.
+        control = run_injected(1, target=path + ".not-the-target")
+        self.assertVerifyOk(control, "shim control run")
+
+        for fail_after in (1, READ_CHUNK, len(data) - 1):
+            with self.subTest(fail_after=fail_after):
+                result = run_injected(fail_after)
+                self.assertEqual(result.returncode, 1,
+                                 f"fail_after={fail_after}: expected exit 1, "
+                                 f"got {result.returncode}")
+                self.assertEqual(result.stdout, b"",
+                                 f"fail_after={fail_after}: no OK may be "
+                                 f"printed for a partially read message")
+                self.assertIn(b"read", result.stderr.lower())
+
+    def test_58_verify_empty_file_ok(self):
+        """An empty file is a valid message for verification too."""
+        tag = expected_hmac("0b" * 20, b"")
+        self.assertVerifyOk(
+            self.run_verify("0b" * 20, self.fixture("empty"), tag),
+            "empty file")
 
     # -- entry-point compatibility -----------------------------------------
 
