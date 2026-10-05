@@ -1,7 +1,8 @@
-// HMAC() from <openssl/hmac.h> is available in both OpenSSL 1.1.1 and
-// OpenSSL 3.x. OpenSSL 3.x marks it deprecated in favour of the EVP_MAC
-// interface (which 1.1.1 does not have); suppress those deprecation
-// warnings so the portable interface builds cleanly on 3.x.
+// The incremental HMAC_CTX interface (HMAC_Init_ex/HMAC_Update/HMAC_Final)
+// from <openssl/hmac.h> is available in both OpenSSL 1.1.1 and OpenSSL 3.x.
+// OpenSSL 3.x marks it deprecated in favour of the EVP_MAC interface (which
+// 1.1.1 does not have); suppress those deprecation warnings so the portable
+// interface builds cleanly on 3.x.
 #define OPENSSL_SUPPRESS_DEPRECATED
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
@@ -10,6 +11,7 @@
 #include <cstddef>
 #include <fstream>
 #include <iostream>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -57,48 +59,85 @@ std::string hexEncode(const unsigned char* data, std::size_t length) {
     return out;
 }
 
-// Read every raw byte of the file. The bytes are not interpreted as text:
-// trailing newlines are kept, line endings are not converted and zero bytes
-// are preserved. An empty file yields an empty message.
-bool readFileBytes(const std::string& path, std::vector<unsigned char>& out) {
+// Outcome of streaming a message file through the HMAC computation. The
+// caller reports read failures and computation failures differently, so the
+// two are kept distinct instead of collapsing them into a single bool.
+enum class TagFileResult {
+    kOk,
+    kReadError,
+    kHmacError,
+};
+
+// Compute the HMAC-SHA-256 tag of a file's complete raw byte content without
+// ever holding the whole message in memory: the file is read in fixed-size
+// chunks and each chunk is fed to the incremental HMAC interface, so the
+// extra memory needed stays bounded no matter how large the file grows.
+//
+// The bytes are not interpreted as text: trailing newlines are kept, line
+// endings are not converted and zero bytes are preserved. An empty file
+// yields the tag of the empty message (the update loop simply runs zero
+// times before HMAC_Final).
+//
+// The HMAC_CTX interface exists in both OpenSSL 1.1.1 and OpenSSL 3.x and
+// implements the same standard HMAC construction (RFC 2104) as the one-shot
+// HMAC() function, so keys longer than the SHA-256 block size are hashed
+// exactly as the standard requires and both environments produce tags
+// identical to the previous one-shot implementation.
+TagFileResult hmacSha256File(const std::vector<unsigned char>& key,
+                             const std::string& path,
+                             std::array<unsigned char, EVP_MAX_MD_SIZE>& mac,
+                             std::size_t& macLength) {
     std::ifstream in(path, std::ios::binary | std::ios::in);
     if (!in) {
-        return false;
+        return TagFileResult::kReadError;
     }
+
+    // HMAC_CTX_new never fails in practice but is checked anyway; a null
+    // context is a computation failure, not a read failure.
+    HMAC_CTX* rawCtx = HMAC_CTX_new();
+    if (rawCtx == nullptr) {
+        return TagFileResult::kHmacError;
+    }
+    const std::unique_ptr<HMAC_CTX, decltype(&HMAC_CTX_free)> ctx(rawCtx,
+                                                                  &HMAC_CTX_free);
+
+    // The key is validated to be non-empty before this is called, so
+    // key.data() is always valid.
+    if (HMAC_Init_ex(ctx.get(), key.data(), static_cast<int>(key.size()),
+                     EVP_sha256(), nullptr) != 1) {
+        return TagFileResult::kHmacError;
+    }
+
     std::array<char, 65536> buffer{};
     while (in.read(buffer.data(), static_cast<std::streamsize>(buffer.size()))) {
-        out.insert(out.end(), buffer.begin(),
-                   buffer.begin() + in.gcount());
+        if (HMAC_Update(ctx.get(),
+                        reinterpret_cast<const unsigned char*>(buffer.data()),
+                        buffer.size()) != 1) {
+            return TagFileResult::kHmacError;
+        }
     }
     if (in.bad()) {
-        return false;
+        // The read failed partway through the message; a tag computed from
+        // the partial content would be meaningless, so nothing is emitted.
+        return TagFileResult::kReadError;
     }
-    out.insert(out.end(), buffer.begin(),
-               buffer.begin() + in.gcount());
-    return true;
-}
+    // Feed the final partial chunk (zero bytes for an empty file or an exact
+    // multiple of the buffer size); the last bytes of a large file are
+    // authenticated just like any other.
+    const std::streamsize tail = in.gcount();
+    if (tail > 0 &&
+        HMAC_Update(ctx.get(),
+                    reinterpret_cast<const unsigned char*>(buffer.data()),
+                    static_cast<std::size_t>(tail)) != 1) {
+        return TagFileResult::kHmacError;
+    }
 
-// Compute HMAC-SHA-256 with the one-shot HMAC() interface from libcrypto.
-// It exists in both OpenSSL 1.1.1 and OpenSSL 3.x and implements the
-// standard HMAC construction (RFC 2104), so keys longer than the SHA-256
-// block size are hashed exactly as the standard requires and both
-// environments produce identical tags.
-bool hmacSha256(const std::vector<unsigned char>& key,
-                const std::vector<unsigned char>& message,
-                std::array<unsigned char, EVP_MAX_MD_SIZE>& mac,
-                std::size_t& macLength) {
-    // The key is validated to be non-empty before this is called, so
-    // key.data() is always valid. A null message pointer with length 0 is
-    // accepted and authenticates the empty message.
-    const unsigned char* msg =
-        message.empty() ? nullptr : message.data();
     unsigned int outLength = 0;
-    if (HMAC(EVP_sha256(), key.data(), static_cast<int>(key.size()), msg,
-             message.size(), mac.data(), &outLength) == nullptr) {
-        return false;
+    if (HMAC_Final(ctx.get(), mac.data(), &outLength) != 1) {
+        return TagFileResult::kHmacError;
     }
     macLength = outLength;
-    return true;
+    return TagFileResult::kOk;
 }
 
 int runTag(int argc, char* argv[]) {
@@ -153,15 +192,14 @@ int runTag(int argc, char* argv[]) {
         return 2;
     }
 
-    std::vector<unsigned char> message;
-    if (!readFileBytes(filePath, message)) {
+    std::array<unsigned char, EVP_MAX_MD_SIZE> mac{};
+    std::size_t macLength = 0;
+    const TagFileResult result = hmacSha256File(key, filePath, mac, macLength);
+    if (result == TagFileResult::kReadError) {
         std::cerr << "messagetag tag: error: failed to read file: " << filePath << "\n";
         return 1;
     }
-
-    std::array<unsigned char, EVP_MAX_MD_SIZE> mac{};
-    std::size_t macLength = 0;
-    if (!hmacSha256(key, message, mac, macLength)) {
+    if (result != TagFileResult::kOk) {
         std::cerr << "messagetag tag: error: HMAC-SHA-256 computation failed\n";
         return 1;
     }
