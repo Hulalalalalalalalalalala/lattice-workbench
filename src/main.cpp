@@ -70,39 +70,55 @@ std::string hexEncode(const unsigned char* data, std::size_t length) {
 }
 
 // Parse options of the form "--name value" starting at argv[2]. On a usage
-// problem (an unknown argument, or an option without a following value) a
+// problem (an unknown argument, or an option without a value) a
 // command-specific diagnostic and the usage line are written to stderr and
 // this returns false; the caller then exits with code 2. On success the
 // collected values are stored keyed by option name, and the caller checks
 // which required options are present. Only the value-taking options named
 // in `names` are accepted.
+//
+// An option is treated as missing its value in two cases: when no argument
+// follows it at all, or when the next argument is exactly equal to one of
+// the option names accepted by THIS command (including the same option
+// repeated). The following option is then reported as the missing-value
+// error instead of being swallowed as the value, so it is never mistaken
+// for a file path or key/tag material. A token that merely starts with a
+// dash but is not an accepted option name (e.g. "--notes", "-x", the
+// literal "./--file") is still a normal value; an explicitly passed empty
+// string is likewise a value and is validated by the caller, not turned
+// into a missing-value error.
 bool parseValueOptions(int argc, char* argv[], std::string_view command,
                        std::string_view usage,
                        const std::vector<std::string_view>& names,
                        std::map<std::string, std::string>& values) {
-    for (int i = 2; i < argc; ++i) {
-        std::string arg(argv[i]);
-        bool recognized = false;
+    auto isName = [&names](std::string_view token) {
         for (std::string_view name : names) {
-            if (arg == name) {
-                recognized = true;
-                break;
+            if (token == name) {
+                return true;
             }
         }
-        if (!recognized) {
+        return false;
+    };
+    for (int i = 2; i < argc; ++i) {
+        std::string_view arg(argv[i]);
+        if (!isName(arg)) {
             std::cerr << "messagetag " << command
                       << ": error: unknown argument '" << arg << "'\n"
                       << usage;
             return false;
         }
-        if (i + 1 >= argc) {
+        // End of argv, or an accepted option name in the next position,
+        // means this option was not given a value. The next token is never
+        // consumed (and deliberately not echoed: it may itself be a key or
+        // a tag the user supplied).
+        if (i + 1 >= argc || isName(argv[i + 1])) {
             std::cerr << "messagetag " << command
                       << ": error: option '" << arg
                       << "' requires a value\n"
                       << usage;
             return false;
         }
-        values[arg] = argv[++i];
+        values[std::string(arg)] = argv[++i];
     }
     return true;
 }

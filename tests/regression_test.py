@@ -602,6 +602,101 @@ class TagRegression(unittest.TestCase):
                 self.assertIn(b"read", result.stderr.lower())
                 self.assertNotRegex(result.stderr, rb"[0-9a-f]{64}")
 
+    def assertMissingValue(self, argv, option):
+        """A value-taking option is missing its value: exit 2, no bytes on
+        stdout, a diagnostic that names exactly that option and gives the
+        tag usage. The rest of the command line (later keys/tags) must not
+        be dumped into the diagnostic."""
+        result = subprocess.run(argv, capture_output=True)
+        label = repr(argv[2:])
+        self.assertEqual(
+            result.returncode, 2,
+            f"{label}: expected exit 2 for a missing value, got "
+            f"{result.returncode}; stderr={result.stderr!r}")
+        self.assertEqual(result.stdout, b"",
+                         f"{label}: stdout must be empty")
+        self.assertIn(b"requires a value", result.stderr,
+                      f"{label}: must report the missing value")
+        self.assertIn(option.encode(), result.stderr,
+                      f"{label}: must name the option {option!r}")
+        self.assertIn(b"Usage: messagetag tag", result.stderr,
+                      f"{label}: must give the tag usage")
+        return result
+
+    def test_35_option_value_missing_before_another_option(self):
+        """A value-taking option is missing its value when nothing follows
+        it OR the next token exactly equals an option name accepted by this
+        command -- including the same name repeated. The following option
+        must never be swallowed as the value: it is neither reported as a
+        file-read failure nor, when a file of that name happens to exist,
+        authenticated to produce a tag. This is reported before the message
+        file is read."""
+        good = self.fixture("hello_lf")
+        tag = ("307a25cbcb6cbca48f5dd2b05fd9174c"
+               "0cf17580f4ea8dd667092f11a77b4d5d")
+
+        # A file literally named "--file" exists: the old parser treated
+        # the second --file as this path and could tag it (or fail to read
+        # it); either outcome is wrong now.
+        with open(os.path.join(self.tmpdir, "--file"), "wb") as f:
+            f.write(b"hello\n")
+
+        missing_value = [
+            ("--file", [self.exe, "tag", "--file", "--file"]),
+            ("--file", [self.exe, "tag", "--key-hex", "0001",
+                        "--file", "--file"]),
+            ("--key-hex", [self.exe, "tag", "--key-hex", "--key-hex",
+                           "0001", "--file", good]),
+            ("--file", [self.exe, "tag", "--key-hex", "0001",
+                        "--file", "--key-hex"]),
+            ("--key-hex", [self.exe, "tag", "--key-hex"]),
+            ("--file", [self.exe, "tag", "--key-hex", "0001", "--file"]),
+        ]
+        for option, argv in missing_value:
+            with self.subTest(case=repr(argv[2:])):
+                r = self.assertMissingValue(argv, option)
+                # The diagnostic names the option but must not carry the
+                # surrounding command line or any later key material.
+                self.assertNotIn(b"0001", r.stderr)
+                self.assertNotRegex(r.stderr, rb"[0-9a-f]{64}")
+
+        # A token that merely starts with a dash but is NOT exactly an
+        # accepted option name is still a file path: "--notes" is not a tag
+        # option, so it names the file, not a missing value.
+        with open(os.path.join(self.tmpdir, "--notes"), "wb") as f:
+            f.write(b"hello\n")
+        self.assertTagSuccess(
+            subprocess.run([self.exe, "tag", "--key-hex", "0001",
+                            "--file", os.path.join(self.tmpdir, "--notes")],
+                           capture_output=True),
+            tag, "--notes is a file path for tag, not an option")
+
+        # The file literally named --file is addressed with an explicit
+        # path prefix. Quoting the bare token cannot add bytes to argv, so
+        # the quoted bare form is still a missing value (checked above).
+        self.assertTagSuccess(
+            subprocess.run(
+                [self.exe, "tag", "--key-hex", "0001", "--file",
+                 os.path.join(self.tmpdir, ".", "--file")],
+                capture_output=True),
+            tag, "./--file explicitly names the file")
+
+        # An explicitly passed empty string is a VALUE, not a missing
+        # value: the empty key is a key-format error, the empty path a
+        # read failure -- their prior semantics are preserved.
+        r = subprocess.run(
+            [self.exe, "tag", "--key-hex", "", "--file", good],
+            capture_output=True)
+        self.assertEqual(r.returncode, 2)
+        self.assertEqual(r.stdout, b"")
+        self.assertIn(b"invalid --key-hex", r.stderr)
+        r = subprocess.run(
+            [self.exe, "tag", "--key-hex", "0001", "--file", ""],
+            capture_output=True)
+        self.assertEqual(r.returncode, 1)
+        self.assertEqual(r.stdout, b"")
+        self.assertIn(b"read", r.stderr.lower())
+
     # -- entry-point compatibility -----------------------------------------
 
     def test_40_version_entry_point(self):
@@ -916,6 +1011,96 @@ class VerifyRegression(unittest.TestCase):
             with self.subTest(argv=argv[2:]):
                 r = subprocess.run(argv, capture_output=True)
                 self.assertUsageError(r, repr(argv))
+
+    def test_74_option_value_missing_before_another_option(self):
+        """An option is missing its value when nothing follows it or when
+        the next token exactly equals an option accepted by verify -- the
+        same name repeated counts. The following option is never consumed
+        as the value, so neither a valid key/tag attached to it nor a file
+        that happens to have the option's name may turn the error into a
+        read failure, a mismatch or a success. Reported before the file is
+        read, with no echo of the key or tag and no dump of the full
+        command line."""
+        path = self.fixture("hello_lf")
+        good = ("307a25cbcb6cbca48f5dd2b05fd9174c"
+                "0cf17580f4ea8dd667092f11a77b4d5d")
+
+        # A file literally named "--file" exists; --file --file must still
+        # be a missing-value error, never verification of that file.
+        with open(os.path.join(self.tmpdir, "--file"), "wb") as f:
+            f.write(b"hello\n")
+
+        # (option that must be named in the diagnostic, full argv)
+        cases = [
+            ("--file", [self.exe, "verify", "--key-hex", "0001",
+                        "--file", "--file", "--tag-hex", good]),
+            # The valid tag belongs to --tag-hex, which is swallowed as the
+            # file by the old parser: it must remain a missing-value error
+            # for --file (not a read failure / mismatch / OK).
+            ("--file", [self.exe, "verify", "--key-hex", "0001",
+                        "--file", "--tag-hex", good]),
+            ("--file", [self.exe, "verify", "--key-hex", "0001",
+                        "--file", "--key-hex", "0002", "--tag-hex", good]),
+            ("--key-hex", [self.exe, "verify", "--key-hex", "--file",
+                           path, "--tag-hex", good]),
+            ("--key-hex", [self.exe, "verify", "--key-hex", "--key-hex",
+                           "0001", "--file", path, "--tag-hex", good]),
+            ("--tag-hex", [self.exe, "verify", "--key-hex", "0001",
+                           "--file", path, "--tag-hex", "--tag-hex", good]),
+            ("--tag-hex", [self.exe, "verify", "--key-hex", "0001",
+                           "--file", path, "--tag-hex"]),
+            ("--file", [self.exe, "verify", "--key-hex", "0001", "--file"]),
+            ("--key-hex", [self.exe, "verify", "--key-hex"]),
+        ]
+        for option, argv in cases:
+            with self.subTest(case=repr(argv[2:])):
+                r = subprocess.run(argv, capture_output=True)
+                self.assertUsageError(r, repr(argv))
+                self.assertIn(b"requires a value", r.stderr,
+                              f"{argv!r}: must report the missing value")
+                self.assertIn(option.encode(), r.stderr,
+                              f"{argv!r}: must name {option!r}")
+                self.assertNoSecretLeak(r, good, "0001", repr(argv))
+
+        # "--notes" is not an option of verify either, so after --file it
+        # is a file path; with a real file of that name and the matching
+        # key/tag verification must succeed.
+        with open(os.path.join(self.tmpdir, "--notes"), "wb") as f:
+            f.write(b"hello\n")
+        self.assertVerifyOk(
+            subprocess.run(
+                [self.exe, "verify", "--key-hex", "0001",
+                 "--file", os.path.join(self.tmpdir, "--notes"),
+                 "--tag-hex", good], capture_output=True),
+            "--notes is a file path for verify, not an option")
+
+        # The file literally named --file is addressed via an explicit
+        # path prefix and verifies normally.
+        self.assertVerifyOk(
+            subprocess.run(
+                [self.exe, "verify", "--key-hex", "0001",
+                 "--file", os.path.join(self.tmpdir, ".", "--file"),
+                 "--tag-hex", good], capture_output=True),
+            "./--file explicitly names the file")
+
+        # Explicit empty strings remain VALUES with their prior semantics,
+        # distinct from a missing value.
+        r = subprocess.run(
+            [self.exe, "verify", "--key-hex", "", "--file", path,
+             "--tag-hex", good], capture_output=True)
+        self.assertUsageError(r, "empty key")
+        self.assertIn(b"invalid --key-hex", r.stderr)
+        r = subprocess.run(
+            [self.exe, "verify", "--key-hex", "0001", "--file", path,
+             "--tag-hex", ""], capture_output=True)
+        self.assertUsageError(r, "empty tag")
+        self.assertIn(b"invalid --tag-hex", r.stderr)
+        r = subprocess.run(
+            [self.exe, "verify", "--key-hex", "0001", "--file", "",
+             "--tag-hex", good], capture_output=True)
+        self.assertEqual(r.returncode, 1)
+        self.assertEqual(r.stdout, b"")
+        self.assertIn(b"read", r.stderr.lower())
 
     # -- read / computation failures ---------------------------------------
 
