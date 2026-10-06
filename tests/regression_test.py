@@ -40,6 +40,20 @@ instead of dying from SIGPIPE. Both commands must then show one
 the supplied tag or the recomputed tag, print usage, or exit 0 on the
 strength of the residual prefix already delivered.
 
+The mirror-image case is pinned just as hard: *recoverable* output
+trouble -- short writes and transient EINTRs, including interruptions
+before the first byte, after a non-empty prefix, and when only the
+trailing newline remains -- must still end in exit 0 with exactly the
+complete result line on stdout (the accepted prefix appearing exactly
+once, in order, with no duplication and no missing trailing newline) and
+empty stderr. The shim's scripted mode
+(MESSAGETAG_WRITE_FAULT_SCRIPT) replays those sequences deterministically
+and appends every intercepted write to a trace file, so the tests prove
+the interruptions were actually injected rather than the shim being
+inert. A permanent error (EPIPE/ENOSPC/EIO) arriving after such
+recoverable steps keeps the original failure contract: exit 1, only the
+accepted prefix on stdout, one output-write diagnostic.
+
 The ``verify`` suite additionally pins: success prints exactly ``OK\\n``;
 a tag that fails to authenticate gives exit 3 with empty stdout and a
 diagnostic that neither names a cause nor leaks the recomputed tag, a
@@ -54,6 +68,7 @@ Usage:
         [/path/to/libwrite_fault_shim.so]
 """
 
+import errno
 import hashlib
 import hmac as py_hmac
 import os
@@ -315,6 +330,149 @@ def assert_stdout_write_failure(case, result, full_line, after,
         if secret:
             case.assertNotIn(secret.lower().encode(), lower,
                              f"{label}: secret material must not be echoed")
+
+
+# ---------------------------------------------------------------------------
+# Scripted write faults: recoverable interruptions (short writes, EINTR)
+# optionally followed by a permanent error.
+# ---------------------------------------------------------------------------
+
+# Errno names the write-fault shim accepts in MESSAGETAG_WRITE_FAULT_SCRIPT.
+SCRIPT_ERRNOS = {
+    "EINTR": errno.EINTR,
+    "EPIPE": errno.EPIPE,
+    "ENOSPC": errno.ENOSPC,
+    "EIO": errno.EIO,
+}
+
+
+def run_with_write_script(argv, shim, steps, trace_path):
+    """Run the full command ``argv`` with the write-fault shim in scripted
+    mode: ``steps`` is a list of integers (deliver at most that many bytes
+    of the next write -- a short write), "EINTR" (fail that write with
+    EINTR, expecting the caller to retry) and "EPIPE"/"ENOSPC"/"EIO" (fail
+    permanently from that write on). Once the script is exhausted, writes
+    to standard output pass through untouched. The shim appends one line
+    per intercepted write to ``trace_path`` so the test can prove the
+    interruptions really happened, in order."""
+    env = dict(os.environ)
+    env["LD_PRELOAD"] = shim
+    env["MESSAGETAG_WRITE_FAULT_FD"] = "1"
+    env["MESSAGETAG_WRITE_FAULT_SCRIPT"] = ",".join(
+        str(step) for step in steps)
+    env["MESSAGETAG_WRITE_FAULT_TRACE"] = trace_path
+    if os.path.exists(trace_path):
+        os.unlink(trace_path)
+    return subprocess.run(argv, capture_output=True, env=env)
+
+
+def read_write_trace(trace_path):
+    """The shim's trace as a list of events: b"D<n>" (n bytes delivered),
+    b"E<n>" (write failed with errno n), b"P<n>" (n bytes passed through
+    after the script ended)."""
+    with open(trace_path, "rb") as f:
+        return f.read().split()
+
+
+def expected_write_trace(steps, line_len):
+    """Replay ``steps`` against a result line of ``line_len`` bytes exactly
+    the way the shim and a correct caller interact: an integer step
+    delivers a short write of min(step, remaining) bytes, "EINTR" fails one
+    write and is retried, a permanent errno fails one write and ends the
+    attempt, and bytes still unsent when the script runs out go through as
+    one final pass-through write. Returns (events, latched)."""
+    events = []
+    remaining = line_len
+    for step in steps:
+        if remaining == 0:
+            break
+        if isinstance(step, int):
+            n = min(step, remaining)
+            events.append(b"D%d" % n)
+            remaining -= n
+        elif step == "EINTR":
+            events.append(b"E%d" % errno.EINTR)
+        else:
+            events.append(b"E%d" % SCRIPT_ERRNOS[step])
+            return events, True
+    if remaining > 0:
+        events.append(b"P%d" % remaining)
+    return events, False
+
+
+def scripted_prefix_len(steps, line_len):
+    """How many bytes of the result line the receiver holds once ``steps``
+    ends in a permanent error: the short writes before it, each capped by
+    what remains of the line."""
+    remaining = line_len
+    delivered = 0
+    for step in steps:
+        if remaining == 0:
+            break
+        if isinstance(step, int):
+            n = min(step, remaining)
+            delivered += n
+            remaining -= n
+        elif step == "EINTR":
+            continue
+        else:
+            break
+    return delivered
+
+
+def run_tag_or_verify_script(case, argv, steps, tmpdir):
+    """Shared driver for the scripted-fault tests: run ``argv`` under the
+    shim with ``steps`` and return (result, trace). The trace is what makes
+    the success cases non-vacuous -- without it, an inert shim would let
+    every recoverable-fault test pass without injecting anything."""
+    trace_path = os.path.join(tmpdir, "write-trace.log")
+    result = run_with_write_script(argv, case.write_shim, steps, trace_path)
+    return result, read_write_trace(trace_path)
+
+
+def assert_recoverable_script_succeeds(case, argv, steps, tmpdir, full_line,
+                                       assert_success, label=""):
+    """A bounded sequence of short writes and EINTRs -- before any byte,
+    mid-line, or with only the trailing newline left -- must not change
+    the observable success contract: exit 0, empty stderr, and stdout
+    holding exactly ``full_line`` once (the already-accepted prefix is not
+    re-emitted, the remainder follows in order, the trailing newline is
+    not dropped). The trace must show every scripted step was consumed,
+    proving the interruptions were injected and retried."""
+    result, trace = run_tag_or_verify_script(case, argv, steps, tmpdir)
+    assert_success(result, label or f"steps={steps}")
+    expected, latched = expected_write_trace(steps, len(full_line))
+    case.assertFalse(latched, f"{label}: test bug: script latches")
+    case.assertEqual(
+        trace, expected,
+        f"{label}: the shim must have injected exactly the scripted "
+        f"interruptions (steps={steps}); got trace {trace}")
+    # Belt and braces on top of assert_success: the line appears exactly
+    # once -- no duplicated prefix, no re-emitted line after recovery.
+    case.assertEqual(result.stdout.count(full_line), 1,
+                     f"{label}: the complete line must appear exactly once")
+    case.assertEqual(len(result.stdout), len(full_line),
+                     f"{label}: no extra bytes around the result line")
+
+
+def assert_scripted_permanent_failure(case, argv, steps, tmpdir, full_line,
+                                      secret_hexes=(), label=""):
+    """Recoverable steps followed by a permanent error keep the original
+    failure contract: exit 1, only the prefix accepted before the
+    permanent error on stdout, and exactly one output-write diagnostic --
+    the earlier EINTRs and short writes neither turned the run into a
+    success nor produced extra diagnostics."""
+    result, trace = run_tag_or_verify_script(case, argv, steps, tmpdir)
+    after = scripted_prefix_len(steps, len(full_line))
+    assert_stdout_write_failure(
+        case, result, full_line, after, secret_hexes=secret_hexes,
+        label=label or f"steps={steps}")
+    expected, latched = expected_write_trace(steps, len(full_line))
+    case.assertTrue(latched, f"{label}: test bug: script never latches")
+    case.assertEqual(
+        trace, expected,
+        f"{label}: the shim must have injected exactly the scripted "
+        f"interruptions (steps={steps}); got trace {trace}")
 
 
 def run_with_closed_stdout(argv):
@@ -912,6 +1070,94 @@ class TagRegression(unittest.TestCase):
         self.assertIn(b"read", r.stderr.lower())
         self.assertNotIn(WRITE_FAIL_MARKER, r.stderr.lower())
 
+    # -- recoverable output interruptions still deliver the full result ---
+
+    def tag_script_success(self, steps, label=""):
+        """Run tag under a scripted sequence of short writes / EINTRs that
+        all recover, and pin the full success contract against the
+        independently computed tag constant (never the program's own
+        earlier output)."""
+        assert_recoverable_script_succeeds(
+            self, self.tag_argv(), steps, self.tmpdir, self.TAG_LINE,
+            lambda r, lbl: self.assertTagSuccess(
+                r, self.TAG_LINE[:-1].decode(), lbl),
+            label or f"tag steps={steps}")
+
+    def test_46_eintr_before_any_byte_still_succeeds(self):
+        """Writes transiently interrupted before a single byte has been
+        accepted must not fail the run or corrupt the result: once the
+        write succeeds the whole 65-byte line lands exactly once, stderr
+        stays empty and the exit code is 0."""
+        if self.write_shim is None:
+            self.skipTest("write-fault shim not available")
+        for steps in (["EINTR"], ["EINTR", "EINTR", "EINTR"]):
+            with self.subTest(steps=steps):
+                self.tag_script_success(steps)
+
+    def test_47_short_writes_and_eintr_interleaved_still_succeed(self):
+        """A non-empty prefix already delivered, then interruptions and
+        more short writes: the receiver keeps the prefix exactly once and
+        the remainder follows in order, so stdout is exactly the tag line.
+        Includes scripts with no EINTR at all (pure short writes) and
+        bursts of consecutive interrupts."""
+        if self.write_shim is None:
+            self.skipTest("write-fault shim not available")
+        scripts = [
+            [10, "EINTR"],
+            [1, "EINTR", "EINTR"],
+            [32, "EINTR", 20, "EINTR"],
+            [7, "EINTR", "EINTR", 7, 7, 7, "EINTR", 7],
+            [1, 2, 3, "EINTR", 5, 8, "EINTR", 13, 21],
+            [10, 20, 30, 4, 1],          # short writes only, no interrupt
+            [1] * 64 + [1],              # one byte at a time, no interrupt
+        ]
+        for steps in scripts:
+            with self.subTest(steps=steps):
+                self.tag_script_success(steps)
+
+    def test_48_only_trailing_newline_left_when_interrupted(self):
+        """All 64 tag characters accepted, only the trailing newline left,
+        and the write is then interrupted one or more times: the command
+        must not finish early (the newline is still owed), and after
+        recovery it must emit just the newline -- not restart the line,
+        which would duplicate the tag on stdout."""
+        if self.write_shim is None:
+            self.skipTest("write-fault shim not available")
+        scripts = [
+            [64, "EINTR"],
+            [64, "EINTR", "EINTR"],
+            [10, 54, "EINTR"],
+            [63, "EINTR", 1, "EINTR"],
+        ]
+        for steps in scripts:
+            with self.subTest(steps=steps):
+                self.tag_script_success(steps)
+
+    def test_49_permanent_error_after_recoverable_steps(self):
+        """EINTRs and short writes that recover, then a permanent error
+        (EPIPE/ENOSPC/EIO) before the line is complete: the original
+        failure contract applies unchanged -- exit 1, only the accepted
+        prefix on stdout, one output-write diagnostic, no usage, no key or
+        tag echoed. The earlier recoverable interruptions must not have
+        turned the run into a success or added diagnostics."""
+        if self.write_shim is None:
+            self.skipTest("write-fault shim not available")
+        scripts = [
+            ["EINTR", "EPIPE"],                       # nothing delivered
+            ["EINTR", "EINTR", "ENOSPC"],
+            [10, "EINTR", "EPIPE"],                   # prefix, interrupt
+            [5, "EINTR", 9, "EINTR", "EIO"],          # interleaved
+            [64, "EINTR", "ENOSPC"],                  # only newline owed
+            [1, "EINTR", 63, "EIO"],                  # one byte short
+        ]
+        for steps in scripts:
+            with self.subTest(steps=steps):
+                assert_scripted_permanent_failure(
+                    self, self.tag_argv(), steps, self.tmpdir, self.TAG_LINE,
+                    secret_hexes=("0001",), label=f"tag steps={steps}")
+
+
+
     # -- entry-point compatibility -----------------------------------------
 
     def test_40_version_entry_point(self):
@@ -1434,6 +1680,64 @@ class VerifyRegression(unittest.TestCase):
         self.assertEqual(r.returncode, 1)
         self.assertIn(b"read", r.stderr.lower())
         self.assertNotIn(WRITE_FAIL_MARKER, r.stderr.lower())
+
+    # -- recoverable output interruptions still deliver the full result ---
+
+    GOOD_TAG = ("307a25cbcb6cbca48f5dd2b05fd9174c0cf17580f4ea8dd667092f11"
+                "a77b4d5d")
+
+    def verify_script_success(self, steps, label=""):
+        """Run verify under a scripted sequence of short writes / EINTRs
+        that all recover: a passed authentication must still surface as
+        exit 0, exactly b'OK\\n' on stdout and empty stderr -- the
+        interruption must not turn a valid authentication into a reported
+        failure."""
+        assert_recoverable_script_succeeds(
+            self, self.verify_argv(), steps, self.tmpdir, self.OK_LINE,
+            self.assertVerifyOk, label or f"verify steps={steps}")
+
+    def test_94_eintr_and_short_writes_still_give_ok(self):
+        """Transient EINTRs -- before any byte, after a non-empty prefix,
+        and when only the trailing newline is left -- plus interleaved
+        short writes must not fail a passing verification: exit 0, stdout
+        exactly 'OK\\n' once, stderr empty. The shim trace proves each
+        interruption was really injected and retried."""
+        if self.write_shim is None:
+            self.skipTest("write-fault shim not available")
+        scripts = [
+            ["EINTR"],                       # interrupted before any byte
+            ["EINTR", "EINTR", "EINTR"],
+            [1, "EINTR"],                    # "O" delivered, then interrupt
+            [1, "EINTR", 1, "EINTR"],
+            [1, "EINTR", "EINTR", 1],
+            [2, "EINTR"],                    # "OK" out, only '\n' owed
+            [2, "EINTR", "EINTR"],
+            [1, 1, 1],                       # short writes only
+        ]
+        for steps in scripts:
+            with self.subTest(steps=steps):
+                self.verify_script_success(steps)
+
+    def test_95_permanent_error_after_recoverable_steps(self):
+        """Recoverable interruptions followed by a permanent error keep
+        the original failure contract: exit 1, only the accepted prefix
+        on stdout (never a complete 'OK\\n'), one output-write diagnostic
+        that leaks neither the key nor the supplied/recomputed tag."""
+        if self.write_shim is None:
+            self.skipTest("write-fault shim not available")
+        scripts = [
+            ["EINTR", "EPIPE"],                  # nothing delivered
+            ["EINTR", "EINTR", "EIO"],
+            [1, "EINTR", "ENOSPC"],              # "O" delivered
+            [1, "EINTR", 1, "EINTR", "EPIPE"],   # "OK" delivered
+            [2, "EINTR", "EIO"],                 # only newline owed
+        ]
+        for steps in scripts:
+            with self.subTest(steps=steps):
+                assert_scripted_permanent_failure(
+                    self, self.verify_argv(), steps, self.tmpdir,
+                    self.OK_LINE, secret_hexes=("0001", self.GOOD_TAG),
+                    label=f"verify steps={steps}")
 
 
 def main():
