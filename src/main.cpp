@@ -10,7 +10,10 @@
 #include <openssl/hmac.h>
 
 #include <array>
+#include <cerrno>
 #include <cstddef>
+#include <csignal>
+#include <cstring>
 #include <fstream>
 #include <iostream>
 #include <map>
@@ -18,6 +21,8 @@
 #include <string>
 #include <string_view>
 #include <vector>
+
+#include <unistd.h>
 
 namespace {
 
@@ -67,6 +72,50 @@ std::string hexEncode(const unsigned char* data, std::size_t length) {
         out[2 * i + 1] = kHex[data[i] & 0x0F];
     }
     return out;
+}
+
+// Write every byte of the one-line success result to file descriptor 1.
+// This deliberately bypasses std::cout: the write can fail while the
+// stream buffer is flushed, i.e. after the program has already "printed"
+// the whole line. A short write of the remaining bytes is continued (pipes
+// and space-constrained files legitimately accept partial counts); only
+// EINTR is retried after a failed call, so EPIPE/ENOSPC/EIO terminate the
+// attempt immediately. Bytes already accepted by the kernel cannot be
+// taken back and are not re-emitted.
+bool writeAllFd(int fd, std::string_view data) {
+    std::size_t written = 0;
+    while (written < data.size()) {
+        ssize_t n = ::write(fd, data.data() + written, data.size() - written);
+        if (n > 0) {
+            written += static_cast<std::size_t>(n);
+            continue;
+        }
+        if (n < 0 && errno == EINTR) {
+            continue;
+        }
+        return false;
+    }
+    return true;
+}
+
+// Output the single success line and make the exit code depend on it: a
+// correctly computed tag, or a passed comparison, is not success unless
+// the complete line (including the trailing newline) has actually reached
+// standard output. On failure emits exactly one diagnostic that names the
+// result-output stage -- never the key, the supplied tag or a recomputed
+// tag -- and returns false so the caller exits 1. The errno text is saved
+// before anything else can clobber errno.
+bool emitResultLine(std::string_view command, std::string_view line) {
+    if (writeAllFd(STDOUT_FILENO, line)) {
+        return true;
+    }
+    int savedErrno = errno;
+    // One single line, naming only the result-output stage. No key, tag or
+    // recomputed tag is referenced, and no usage text follows.
+    std::cerr << "messagetag " << command
+              << ": error: standard output write failed while outputting "
+                 "the result (" << std::strerror(savedErrno) << ")\n";
+    return false;
 }
 
 // Parse options of the form "--name value" starting at argv[2]. On a usage
@@ -252,7 +301,13 @@ int runTag(int argc, char* argv[]) {
             break;
     }
 
-    std::cout << hexEncode(mac.data(), macLength) << '\n';
+    std::string tagLine = hexEncode(mac.data(), macLength);
+    tagLine.push_back('\n');
+    // Exit 0 only once the whole line is confirmed written; a correct tag
+    // does not make a failed/partial result output a success.
+    if (!emitResultLine("tag", tagLine)) {
+        return 1;
+    }
     return 0;
 }
 
@@ -337,7 +392,12 @@ int runVerify(int argc, char* argv[]) {
         return 3;
     }
 
-    std::cout << "OK\n";
+    // Exit 0 only once the whole "OK\n" line is confirmed written; a
+    // passed comparison does not make a failed/partial result output a
+    // success.
+    if (!emitResultLine("verify", "OK\n")) {
+        return 1;
+    }
     return 0;
 }
 
@@ -348,10 +408,16 @@ int main(int argc, char* argv[]) {
         std::cout << "messagetag 0.1.0\n";
         return 0;
     }
-    if (argc >= 2 && std::string_view(argv[1]) == "tag") {
-        return runTag(argc, argv);
-    }
-    if (argc >= 2 && std::string_view(argv[1]) == "verify") {
+    if (argc >= 2 && (std::string_view(argv[1]) == "tag" ||
+                      std::string_view(argv[1]) == "verify")) {
+        // A closed downstream pipe must surface as an EPIPE write failure
+        // (reported and mapped to exit 1), not as the default SIGPIPE kill,
+        // which would leave the shell with a signal-terminated status and
+        // no diagnostic. Ignore SIGPIPE so write(2) returns EPIPE instead.
+        std::signal(SIGPIPE, SIG_IGN);
+        if (std::string_view(argv[1]) == "tag") {
+            return runTag(argc, argv);
+        }
         return runVerify(argc, argv);
     }
     std::cerr << "Usage: messagetag --version\n"
