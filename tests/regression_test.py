@@ -40,6 +40,20 @@ instead of dying from SIGPIPE. Both commands must then show one
 the supplied tag or the recomputed tag, print usage, or exit 0 on the
 strength of the residual prefix already delivered.
 
+Recoverable output conditions are pinned separately, because they are
+*not* failures. The same shim also has a scripted mode that returns
+EINTR for a finite number of write(2) calls and/or accepts only partial
+byte counts, before (or interleaved with) calls that go through
+normally; the tag run must still exit 0 with exactly the correct 64-hex
+line plus one newline, and a passed verification with exactly "OK\\n",
+with empty stderr in either case. The interruption must be covered both
+before the first byte and after a non-empty prefix -- and in particular
+after the whole 64-character tag (or "OK") is already out with only the
+trailing newline left: the command must neither end early nor replay the
+accepted prefix on recovery. A permanent EPIPE/ENOSPC/EIO that arrives
+only after such a recoverable stretch keeps the failure contract above
+(exactly the prefix actually delivered, one output-write diagnostic).
+
 The ``verify`` suite additionally pins: success prints exactly ``OK\\n``;
 a tag that fails to authenticate gives exit 3 with empty stdout and a
 diagnostic that neither names a cause nor leaks the recomputed tag, a
@@ -267,6 +281,28 @@ def run_with_write_fault(argv, shim, after, fail_errno=FAULT_EPIPE):
     env["MESSAGETAG_WRITE_FAULT_FD"] = "1"
     env["MESSAGETAG_WRITE_FAULT_AFTER"] = str(after)
     env["MESSAGETAG_WRITE_FAULT_ERRNO"] = str(fail_errno)
+    return subprocess.run(argv, capture_output=True, env=env)
+
+
+def run_with_write_script(argv, shim, script):
+    """Run ``argv`` under the write-fault shim in scripted mode: ``script``
+    is a comma-separated list with one event per write(2) call on stdout --
+    "eintr" (the call returns -1/EINTR without delivering a byte),
+    "short:<n>" (the call accepts at most n bytes), "pass" (pass through to
+    the real write), "fail:<errno>" (sticky permanent failure). When the
+    script is exhausted, later writes pass through, which models a writer
+    that is temporarily difficult (interrupted, accepting partial counts)
+    and then recovers. Bytes always flow through the real write() in their
+    original order, so a correct continue/retry loop delivers the line
+    exactly once."""
+    env = dict(os.environ)
+    env["LD_PRELOAD"] = shim
+    env["MESSAGETAG_WRITE_FAULT_FD"] = "1"
+    env["MESSAGETAG_WRITE_FAULT_SCRIPT"] = script
+    # SCRIPT must take precedence; make sure no stale legacy settings leak
+    # in from the surrounding environment.
+    env.pop("MESSAGETAG_WRITE_FAULT_AFTER", None)
+    env.pop("MESSAGETAG_WRITE_FAULT_ERRNO", None)
     return subprocess.run(argv, capture_output=True, env=env)
 
 
@@ -912,6 +948,102 @@ class TagRegression(unittest.TestCase):
         self.assertIn(b"read", r.stderr.lower())
         self.assertNotIn(WRITE_FAIL_MARKER, r.stderr.lower())
 
+    # -- recoverable output trouble must still finish the line ------------
+
+    def test_46_short_writes_and_eintr_recover_into_full_tag(self):
+        """A write that temporarily accepts only part of the line, or
+        temporarily returns EINTR, is not a failure. With valid inputs and a
+        stdout that ultimately accepts the whole line, ``tag`` must still
+        exit 0 with empty stderr and exactly the correct 64-hex line plus
+        its newline -- never just a length-plausible line.
+
+        The scripted shim pins, in order: an interruption before any byte
+        is sent; an interruption after a non-empty prefix; several
+        consecutive short writes; shorts and EINTR interleaved a finite
+        number of times; and the critical tail case where all 64 tag
+        characters are already out and only '\\n' remains. The accepted
+        prefix must appear exactly once, in order, followed by the
+        remainder: recovery retries the unwritten bytes, it never replays
+        accepted ones or stops before the newline."""
+        if self.write_shim is None:
+            self.skipTest("write-fault shim not available (build with CMake "
+                          "or pass its path as the third argument)")
+        expected_tag = self.TAG_LINE[:-1].decode()
+        tag_chars = self.TAG_LINE[:64]
+        scripts = [
+            # EINTR before a single byte has been sent.
+            "eintr,pass",
+            "eintr,eintr,eintr,pass",
+            # EINTR after a non-empty prefix has already been accepted.
+            "short:1,eintr,pass",
+            "short:10,eintr,eintr,pass",
+            "short:32,eintr,short:16,eintr,pass",
+            # Several consecutive short writes, then the remainder.
+            "short:1,short:1,short:7,short:13,short:31,pass",
+            # The whole line accepted one byte per write call.
+            ",".join(["short:1"] * len(self.TAG_LINE)),
+            # Finite shorts and interruptions interleaved, then recovery.
+            "eintr,short:5,eintr,short:5,eintr,eintr,short:20,short:20,pass",
+            # Nothing out first (EINTR), then ragged shorts to the end.
+            "eintr,short:33,short:31,short:1",
+            # All 64 hex characters out, only the newline left: a temporary
+            # interruption must neither end the command early nor restart
+            # the whole line on recovery.
+            "short:64,eintr,pass",
+            "short:64,eintr,eintr,eintr,pass",
+            "short:64,short:1",
+        ]
+        for script in scripts:
+            with self.subTest(script=script):
+                result = run_with_write_script(
+                    self.tag_argv(), self.write_shim, script)
+                self.assertTagSuccess(result, expected_tag, script)
+                # Exact equality already pins order and completeness; these
+                # spell out the no-duplicate/no-hole requirement on the
+                # prefix the receiver already held.
+                self.assertEqual(
+                    result.stdout, tag_chars + b"\n",
+                    f"{script}: line must be tag chars once, then newline")
+                self.assertEqual(result.stdout.count(tag_chars), 1,
+                                 f"{script}: accepted tag prefix re-emitted")
+                self.assertEqual(result.stdout.count(tag_chars[:32]), 1,
+                                 f"{script}: accepted half-line re-emitted")
+                self.assertEqual(result.stdout.find(tag_chars), 0,
+                                 f"{script}: line order changed")
+
+    def test_47_permanent_failure_after_recoverable_stretch_tag(self):
+        """After a finite, recovered run of EINTR/short writes, a permanent
+        EPIPE/ENOSPC/EIO that arrives while the line is still incomplete
+        keeps the existing failure meaning: exit 1, only the bytes actually
+        accepted so far on stdout (never completed or padded afterwards),
+        and exactly one output-write diagnostic on stderr -- no usage, no
+        key echo, no recomputed tag. This includes the point where all 64
+        tag characters are out and only the newline remains missing."""
+        if self.write_shim is None:
+            self.skipTest("write-fault shim not available")
+        # (script, bytes actually delivered before the sticky failure).
+        cases = [
+            ("eintr,fail:32", 0, FAULT_EPIPE),
+            ("short:30,eintr,fail:32", 30, FAULT_EPIPE),
+            ("short:10,eintr,short:20,eintr,eintr,fail:28", 30,
+             FAULT_ENOSPC),
+            ("eintr,short:1,eintr,short:9,fail:5", 10, FAULT_EIO),
+            # Recovered all the way to the last byte, then permanent error.
+            ("short:64,eintr,fail:32", 64, FAULT_EPIPE),
+            ("short:64,fail:5", 64, FAULT_EIO),
+        ]
+        for script, delivered, fail_errno in cases:
+            with self.subTest(script=script):
+                result = run_with_write_script(
+                    self.tag_argv(), self.write_shim, script)
+                assert_stdout_write_failure(
+                    self, result, self.TAG_LINE, delivered,
+                    secret_hexes=("0001",), label=script)
+                # Nothing must follow the residual prefix after the failure.
+                self.assertEqual(
+                    result.stdout, self.TAG_LINE[:delivered],
+                    f"{script}: receiver must hold only the accepted prefix")
+
     # -- entry-point compatibility -----------------------------------------
 
     def test_40_version_entry_point(self):
@@ -1434,6 +1566,84 @@ class VerifyRegression(unittest.TestCase):
         self.assertEqual(r.returncode, 1)
         self.assertIn(b"read", r.stderr.lower())
         self.assertNotIn(WRITE_FAIL_MARKER, r.stderr.lower())
+
+    # -- recoverable output trouble must still finish "OK\n" --------------
+
+    def test_94_short_writes_and_eintr_recover_into_ok(self):
+        """On a passed comparison, recoverable output trouble must not turn
+        valid authentication into a failure. With well-formed inputs and a
+        stdout that ultimately accepts the line, ``verify`` exits 0 with
+        empty stderr and exactly b"OK\\n": an interruption before the first
+        byte, an interruption after the non-empty "O" prefix, repeated short
+        writes, shorts interleaved with a finite number of EINTRs, and the
+        tail case where "OK" is already out and only the newline remains.
+        The recovered line is delivered once, in order -- the prefix the
+        receiver already held is never replayed and the command never ends
+        before the newline."""
+        if self.write_shim is None:
+            self.skipTest("write-fault shim not available (build with CMake "
+                          "or pass its path as the third argument)")
+        tag = ("307a25cbcb6cbca48f5dd2b05fd9174c0cf17580f4ea8dd667092f11"
+               "a77b4d5d")
+        scripts = [
+            # EINTR before any byte is sent.
+            "eintr,pass",
+            "eintr,eintr,eintr,pass",
+            # EINTR after the non-empty "O" prefix is out.
+            "short:1,eintr,pass",
+            "short:1,eintr,eintr,eintr,pass",
+            # Short writes only: "O", then "K", then the newline.
+            "short:1,short:1,short:1",
+            # Interruptions and short writes interleaved a finite number of
+            # times, then normal acceptance.
+            "eintr,short:1,eintr,short:1,eintr,pass",
+            # "OK" already delivered, only the newline left: the temporary
+            # interruption must not stop the command nor re-output "OK".
+            "short:2,eintr,pass",
+            "short:2,eintr,eintr,pass",
+            "short:2,short:1",
+        ]
+        for script in scripts:
+            with self.subTest(script=script):
+                result = run_with_write_script(
+                    self.verify_argv(), self.write_shim, script)
+                self.assertVerifyOk(result, script)
+                # The receiver holds the prefix it already saw exactly once.
+                self.assertEqual(result.stdout.count(b"O"), 1, script)
+                self.assertEqual(result.stdout.count(b"OK"), 1, script)
+                self.assertEqual(result.stdout.find(b"OK"), 0, script)
+
+    def test_95_permanent_failure_after_recoverable_stretch_verify(self):
+        """After a recovered stretch of EINTR/short writes, a permanent
+        EPIPE/ENOSPC/EIO while "OK\\n" is still incomplete keeps the
+        established failure contract: exit 1, stdout holds only the prefix
+        actually delivered (never a completed OK line), stderr one
+        output-write diagnostic with no usage and no echo of the key, the
+        supplied tag or a recomputed tag -- including when "OK" itself is
+        already out and only the newline failed."""
+        if self.write_shim is None:
+            self.skipTest("write-fault shim not available")
+        tag = ("307a25cbcb6cbca48f5dd2b05fd9174c0cf17580f4ea8dd667092f11"
+               "a77b4d5d")
+        # (script, bytes delivered before the sticky failure).
+        cases = [
+            ("eintr,fail:32", 0, FAULT_EPIPE),
+            ("short:1,eintr,fail:28", 1, FAULT_ENOSPC),
+            ("eintr,short:1,eintr,eintr,fail:5", 1, FAULT_EIO),
+            # "OK" is out; the missing newline must still be a failure.
+            ("short:2,eintr,fail:32", 2, FAULT_EPIPE),
+            ("short:2,fail:28", 2, FAULT_ENOSPC),
+        ]
+        for script, delivered, _fail_errno in cases:
+            with self.subTest(script=script):
+                result = run_with_write_script(
+                    self.verify_argv(), self.write_shim, script)
+                assert_stdout_write_failure(
+                    self, result, self.OK_LINE, delivered,
+                    secret_hexes=("0001", tag), label=script)
+                self.assertEqual(
+                    result.stdout, self.OK_LINE[:delivered],
+                    f"{script}: receiver must hold only the accepted prefix")
 
 
 def main():

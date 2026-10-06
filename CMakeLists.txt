@@ -61,8 +61,11 @@ if(Python3_Interpreter_FOUND)
     # bytes, so the regression suite can exercise "open succeeded, partial
     # content read, then the read failed"; the write shim makes standard
     # output fail after a chosen number of bytes, exercising "result line
-    # partly delivered, then the write failed". They are never linked into
-    # messagetag.
+    # partly delivered, then the write failed", and also has a scripted
+    # mode that returns EINTR and/or accepts partial counts for a finite
+    # number of writes before recovering, exercising "temporarily unable
+    # to finish the line, then the full result still goes out". They are
+    # never linked into messagetag.
     add_library(read_fault_shim MODULE tests/read_fault_shim.cpp)
     target_link_libraries(read_fault_shim PRIVATE ${CMAKE_DL_LIBS})
     add_library(write_fault_shim MODULE tests/write_fault_shim.cpp)
