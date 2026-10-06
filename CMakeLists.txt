@@ -56,18 +56,28 @@ target_link_libraries(messagetag PRIVATE OpenSSL::Crypto)
 find_package(Python3 COMPONENTS Interpreter QUIET)
 if(Python3_Interpreter_FOUND)
     enable_testing()
-    # Test-only LD_PRELOAD shim (tests/read_fault_shim.cpp) that makes a
-    # chosen file fail with a read error after a chosen number of bytes, so
-    # the regression suite can exercise "open succeeded, partial content
-    # read, then the read failed". It is never linked into messagetag.
+    # Test-only LD_PRELOAD shims (tests/*_fault_shim.cpp) that make the
+    # chosen operation fail at an injected point, so the regression suite
+    # can exercise failures that file permissions and special files cannot
+    # produce on demand. They are never linked into messagetag.
+    #
+    # read_fault_shim makes a chosen file's read(2) fail with a read error
+    # after a chosen number of bytes ("open succeeded, partial content read,
+    # then the read failed"). write_fault_shim makes standard output's
+    # write(2) fail after a chosen number of result bytes have already been
+    # delivered ("part of the result line reached the recipient, then the
+    # output failed").
     add_library(read_fault_shim MODULE tests/read_fault_shim.cpp)
     target_link_libraries(read_fault_shim PRIVATE ${CMAKE_DL_LIBS})
+    add_library(write_fault_shim MODULE tests/write_fault_shim.cpp)
+    target_link_libraries(write_fault_shim PRIVATE ${CMAKE_DL_LIBS})
     add_test(
         NAME regression
         COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tests/regression_test.py"
                 "$<TARGET_FILE:messagetag>"
-                "$<TARGET_FILE:read_fault_shim>")
+                "$<TARGET_FILE:read_fault_shim>"
+                "$<TARGET_FILE:write_fault_shim>")
     set_tests_properties(regression PROPERTIES
         LABELS "regression"
         TIMEOUT 120)

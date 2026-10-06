@@ -28,6 +28,18 @@ Two file-reading end conditions get dedicated coverage:
   stdout and a read-error message, never a partial-message result. Both
   ``tag`` and ``verify`` are checked this way.
 
+Result *output* failures are covered as their own class: computing the tag
+or passing comparison is not success until the whole one-line result,
+including buffered bytes, has actually reached standard output. Writing to
+``/dev/full`` (the destination refuses every write with ENOSPC) and to a
+pipe whose reading end was closed (which must be reported as exit 1 rather
+than death by SIGPIPE) both require exactly one
+"failed to write result to standard output" diagnostic, and an
+LD_PRELOAD shim (tests/write_fault_shim.cpp) additionally fails the write
+after part of the line has already been delivered. Earlier failures
+(parameter errors, read errors, mismatch) keep their own exit codes even
+when standard output is unwritable.
+
 The ``verify`` suite additionally pins: success prints exactly ``OK\\n``;
 a tag that fails to authenticate gives exit 3 with empty stdout and a
 diagnostic that neither names a cause nor leaks the recomputed tag, a
@@ -38,7 +50,8 @@ encapsulation); and parameter format is checked before the file is opened.
 Usage:
 
     python3 tests/regression_test.py /path/to/messagetag \
-        [/path/to/libread_fault_shim.so]
+        [/path/to/libread_fault_shim.so] \
+        [/path/to/libwrite_fault_shim.so]
 """
 
 import hashlib
@@ -183,20 +196,19 @@ def expected_hmac(key_hex, message):
                        hashlib.sha256).hexdigest()
 
 
-def find_read_fault_shim(shim_path, exe, tmpdir):
-    """Locate (or, as a fallback, build) the LD_PRELOAD read-fault shim
-    used to exercise "open succeeded, partial content read, then the read
-    failed". Returns None when no shim is available; the caller then skips
-    loudly instead of silently losing coverage. Shared by the tag and
-    verify suites so both commands prove they refuse to produce a result
-    from a partially read message."""
+def find_fault_shim(shim_path, exe, tmpdir, shim_stem):
+    """Locate (or, as a fallback, build) an LD_PRELOAD fault-injection
+    shim named ``<shim_stem>.cpp`` (e.g. ``read_fault_shim`` /
+    ``write_fault_shim``), returning the shared-object path. Returns None
+    when no shim is available; the caller then skips loudly instead of
+    silently losing coverage."""
     candidates = []
     if shim_path:
         candidates.append(shim_path)
     exe_dir = os.path.dirname(exe)
     candidates += [
-        os.path.join(exe_dir, "libread_fault_shim.so"),
-        os.path.join(exe_dir, "read_fault_shim.so"),
+        os.path.join(exe_dir, f"lib{shim_stem}.so"),
+        os.path.join(exe_dir, f"{shim_stem}.so"),
     ]
     for path in candidates:
         if os.path.isfile(path):
@@ -204,11 +216,11 @@ def find_read_fault_shim(shim_path, exe, tmpdir):
     # Direct invocation without a CMake build of the shim: compile it
     # from next to this script if a C++ compiler is available.
     src = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                       "read_fault_shim.cpp")
+                       f"{shim_stem}.cpp")
     compiler = shutil.which("c++") or shutil.which("g++") \
         or shutil.which("clang++")
     if os.path.isfile(src) and compiler:
-        out = os.path.join(tmpdir, "libread_fault_shim.so")
+        out = os.path.join(tmpdir, f"lib{shim_stem}.so")
         built = subprocess.run(
             [compiler, "-shared", "-fPIC", "-O2", "-o", out, src,
              "-ldl"], capture_output=True)
@@ -217,11 +229,99 @@ def find_read_fault_shim(shim_path, exe, tmpdir):
     return None
 
 
+def find_read_fault_shim(shim_path, exe, tmpdir):
+    """Locate the read-fault shim used to exercise "open succeeded,
+    partial content read, then the read failed". Returns None when no
+    shim is available; the caller then skips loudly instead of silently
+    losing coverage. Shared by the tag and verify suites so both commands
+    prove they refuse to produce a result from a partially read
+    message."""
+    return find_fault_shim(shim_path, exe, tmpdir, "read_fault_shim")
+
+
+def find_write_fault_shim(shim_path, exe, tmpdir):
+    """Locate the write-fault shim used to exercise "part of the result
+    line has already been delivered, then standard output fails"."""
+    return find_fault_shim(shim_path, exe, tmpdir, "write_fault_shim")
+
+
+# Phrase every result-output-stage diagnostic must carry, exactly once.
+STDOUT_WRITE_FAILURE = b"failed to write result to standard output"
+
+# Diagnostics for the failure stages that must not be confused with an
+# output failure (and must not accompany the output-failure message).
+OTHER_STAGE_MARKERS = (
+    b"failed to read file", b"computation failed", b"mismatch",
+    b"invalid --key-hex", b"invalid --tag-hex", b"requires a value",
+    b"missing required option", b"unknown argument",
+)
+
+
+def assert_stdout_write_failure(case, result, label=""):
+    """The contract for a failure while delivering the success result:
+    exit 1, exactly one output-stage diagnostic on stderr (no usage line,
+    no other-stage message, no tag/key material), and never exit 0 --
+    regardless of how many result bytes already reached the recipient."""
+    case.assertEqual(
+        result.returncode, 1,
+        f"{label}: an unwritable standard output must end in exit 1, got "
+        f"{result.returncode} (a negative value means death by signal); "
+        f"stdout={result.stdout!r} stderr={result.stderr!r}")
+    case.assertIn(
+        STDOUT_WRITE_FAILURE, result.stderr,
+        f"{label}: stderr must explain that writing the result to standard "
+        f"output failed; got {result.stderr!r}")
+    case.assertEqual(
+        result.stderr.count(STDOUT_WRITE_FAILURE), 1,
+        f"{label}: exactly one output-failure diagnostic allowed; got "
+        f"{result.stderr!r}")
+    case.assertNotIn(b"Usage:", result.stderr,
+                     f"{label}: no command usage may follow the failure")
+    for marker in OTHER_STAGE_MARKERS:
+        case.assertNotIn(marker, result.stderr,
+                         f"{label}: the failure must not be reported as a "
+                         f"different stage ({marker!r}); got "
+                         f"{result.stderr!r}")
+    case.assertNotRegex(result.stderr, rb"(?i)[0-9a-f]{64}",
+                        f"{label}: stderr must not leak a tag")
+
+
+def run_with_closed_stdout(argv):
+    """Run argv with a pipe as stdout whose reading end is already closed
+    before the child starts: the child's first result write hits EPIPE.
+    With SIGPIPE left at its default disposition the process would die of
+    the signal (a negative return code); the contract requires exit 1 and
+    the ordinary output-failure diagnostic instead.
+
+    Python itself runs with SIGPIPE ignored, and an ignored disposition is
+    inherited across fork/exec, which would mask the program's own
+    handling; preexec_fn restores SIGPIPE to its default so the child is
+    launched exactly as a shell would launch it."""
+    def reset_sigpipe():
+        import signal
+        signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+
+    read_end, write_end = os.pipe()
+    os.close(read_end)
+    proc = subprocess.Popen(argv, stdout=write_end,
+                            stderr=subprocess.PIPE,
+                            preexec_fn=reset_sigpipe)
+    os.close(write_end)
+    try:
+        _stdout, stderr = proc.communicate(timeout=30)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        _stdout, stderr = proc.communicate()
+    return subprocess.CompletedProcess(argv, proc.returncode, b"", stderr)
+
+
 class TagRegression(unittest.TestCase):
     exe = None
     tmpdir = None
     shim_path = None   # optional second CLI argument: read-fault shim
+    write_shim_path = None  # optional third CLI argument: write-fault shim
     shim = None
+    write_shim = None
 
     @classmethod
     def setUpClass(cls):
@@ -246,6 +346,8 @@ class TagRegression(unittest.TestCase):
             f.write(b"hello\n")
         cls.fixtures = fixtures
         cls.shim = cls._find_read_fault_shim()
+        cls.write_shim = find_write_fault_shim(
+            cls.write_shim_path, cls.exe, cls.tmpdir)
 
     @classmethod
     def _find_read_fault_shim(cls):
@@ -670,6 +772,90 @@ class TagRegression(unittest.TestCase):
                 self.assertIn(b"read", result.stderr.lower())
                 self.assertNotRegex(result.stderr, rb"[0-9a-f]{64}")
 
+    # -- result-output failures --------------------------------------------
+
+    def _tag_argv(self, key_hex="0001", name="hello_lf"):
+        return [self.exe, "tag", "--key-hex", key_hex,
+                "--file", self.fixture(name)]
+
+    def test_42_tag_dev_full_is_exit_1(self):
+        """Standard output is /dev/full: every write fails with ENOSPC.
+        A correctly computed tag must not be reported as success: exit 1
+        with the single output-stage diagnostic."""
+        with open("/dev/full", "wb") as sink:
+            result = subprocess.run(
+                self._tag_argv(), stdout=sink, stderr=subprocess.PIPE)
+        assert_stdout_write_failure(self, result, "tag -> /dev/full")
+
+    def test_43_tag_closed_read_end_is_exit_1_not_sigpipe(self):
+        """The reading end of the stdout pipe is gone before the child
+        writes. Default SIGPIPE handling would kill the process by signal;
+        the contract requires the same exit-1 output failure as any other
+        unwritable destination."""
+        result = run_with_closed_stdout(self._tag_argv())
+        assert_stdout_write_failure(self, result, "tag -> closed pipe")
+
+    def test_44_tag_partial_write_then_failure_is_exit_1(self):
+        """Some of the tag line may already have reached the recipient
+        before the output fails (buffering decides how much). No split is
+        allowed to return 0 or to emit a second/repaired result: every
+        failing offset gives exit 1 and one output-failure diagnostic."""
+        if self.write_shim is None:
+            self.skipTest("write-fault shim not available (build with "
+                          "CMake or pass its path as the third argument)")
+        # Offsets cover the first write failing outright (the whole line
+        # may already be sitting in a buffer), failure inside the line at
+        # several points, and failure at the final newline. The line is 65
+        # bytes (64 hex chars plus newline); allowing all 65 would not be a
+        # failure at all, so 0..64 is exactly the failing range.
+        for fail_after in (0, 1, 7, 32, 63, 64):
+            with self.subTest(fail_after=fail_after):
+                env = dict(os.environ)
+                env["LD_PRELOAD"] = self.write_shim
+                env["MESSAGETAG_WRITE_FAULT_AFTER"] = str(fail_after)
+                result = subprocess.run(
+                    self._tag_argv(),
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+                assert_stdout_write_failure(
+                    self, result, f"tag partial write after {fail_after}")
+                # Bytes already delivered are a truncated prefix of the
+                # result at best: never the complete, usable line.
+                self.assertNotRegex(
+                    result.stdout, TAG_RE,
+                    f"fail_after={fail_after}: a complete tag line must not "
+                    f"have been delivered; got {result.stdout!r}")
+
+    def test_45_tag_earlier_failure_not_overridden_by_bad_stdout(self):
+        """When an earlier stage fails, its own exit code and diagnostic
+        win even though standard output is unwritable; the output-failure
+        message must not replace or be appended to them."""
+        missing = os.path.join(self.tmpdir, "no-such-output-check.bin")
+        with open("/dev/full", "wb") as sink:
+            # Parameter error (exit 2): bad key, reported before any read
+            # or result output.
+            r = subprocess.run(
+                [self.exe, "tag", "--key-hex", "zz",
+                 "--file", self.fixture("hello_lf")],
+                stdout=sink, stderr=subprocess.PIPE)
+            self.assertEqual(r.returncode, 2,
+                             f"parameter error must stay exit 2; "
+                             f"stderr={r.stderr!r}")
+            self.assertIn(b"invalid --key-hex", r.stderr)
+            self.assertNotIn(STDOUT_WRITE_FAILURE, r.stderr)
+            # Read failure (exit 1): no result is ever written.
+            r = subprocess.run(
+                [self.exe, "tag", "--key-hex", "0001", "--file", missing],
+                stdout=sink, stderr=subprocess.PIPE)
+            self.assertEqual(r.returncode, 1,
+                             f"read failure must stay exit 1; "
+                             f"stderr={r.stderr!r}")
+            self.assertIn(b"failed to read file", r.stderr)
+            self.assertNotIn(STDOUT_WRITE_FAILURE, r.stderr)
+            # stdout was redirected to the file sink, so nothing is
+            # captured here and in any case no result bytes are produced
+            # before either earlier failure.
+            self.assertTrue(r.stdout in (None, b""))
+
     # -- entry-point compatibility -----------------------------------------
 
     def test_40_version_entry_point(self):
@@ -695,7 +881,9 @@ class VerifyRegression(unittest.TestCase):
     exe = None
     tmpdir = None
     shim_path = None
+    write_shim_path = None
     shim = None
+    write_shim = None
 
     # (label, key hex, fixture name, expected tag) -- a spread across empty
     # messages, NUL bytes, trailing newlines, hex-case keys and large files.
@@ -734,6 +922,8 @@ class VerifyRegression(unittest.TestCase):
             f.write(b"hello\n")
         cls.fixtures = fixtures
         cls.shim = find_read_fault_shim(cls.shim_path, cls.exe, cls.tmpdir)
+        cls.write_shim = find_write_fault_shim(
+            cls.write_shim_path, cls.exe, cls.tmpdir)
 
     @classmethod
     def tearDownClass(cls):
@@ -1105,19 +1295,111 @@ class VerifyRegression(unittest.TestCase):
                 self.assertEqual(r2.returncode, 1)
                 self.assertEqual(r2.stdout, b"")
 
+    # -- result-output failures --------------------------------------------
+
+    GOOD_TAG = ("307a25cbcb6cbca48f5dd2b05fd9174c"
+                "0cf17580f4ea8dd667092f11a77b4d5d")
+
+    def _verify_argv(self, tag_hex=GOOD_TAG, name="hello_lf", key="0001"):
+        return [self.exe, "verify", "--key-hex", key,
+                "--file", self.fixture(name), "--tag-hex", tag_hex]
+
+    def test_90_verify_dev_full_is_exit_1(self):
+        """Comparison passed, but "OK\\n" cannot be written: exit 1 with
+        the single output-stage diagnostic rather than a successful
+        verification."""
+        with open("/dev/full", "wb") as sink:
+            result = subprocess.run(
+                self._verify_argv(), stdout=sink, stderr=subprocess.PIPE)
+        assert_stdout_write_failure(self, result, "verify -> /dev/full")
+
+    def test_91_verify_closed_read_end_is_exit_1_not_sigpipe(self):
+        """A closed reading end on the stdout pipe must give the ordinary
+        exit-1 output failure instead of SIGPIPE termination."""
+        result = run_with_closed_stdout(self._verify_argv())
+        assert_stdout_write_failure(self, result, "verify -> closed pipe")
+
+    def test_92_verify_partial_write_then_failure_is_exit_1(self):
+        """Output can fail after "O", after "OK", or only at the newline;
+        a partial "OK" remnant is not a successful verification and no
+        second line is attempted."""
+        if self.write_shim is None:
+            self.skipTest("write-fault shim not available (build with "
+                          "CMake or pass its path as the third argument)")
+        # The result line is 3 bytes: "O", "K", "\n". 0..2 cover every
+        # point at which the remainder can fail; 3 would be plain success.
+        for fail_after in (0, 1, 2):
+            with self.subTest(fail_after=fail_after):
+                env = dict(os.environ)
+                env["LD_PRELOAD"] = self.write_shim
+                env["MESSAGETAG_WRITE_FAULT_AFTER"] = str(fail_after)
+                result = subprocess.run(
+                    self._verify_argv(),
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+                assert_stdout_write_failure(
+                    self, result, f"verify partial write after {fail_after}")
+                self.assertNotEqual(
+                    result.stdout, b"OK\n",
+                    f"fail_after={fail_after}: a complete OK line must not "
+                    f"have been delivered; got {result.stdout!r}")
+
+    def test_93_verify_earlier_failure_not_overridden_by_bad_stdout(self):
+        """Mismatch (3), parameter errors (2) and read failures (1) are
+        decided before the result line exists; an unwritable stdout must
+        not overwrite any of them, and the output-failure diagnostic must
+        not appear on those runs."""
+        missing = os.path.join(self.tmpdir, "no-such-output-verify.bin")
+        with open("/dev/full", "wb") as sink:
+            # Mismatch (exit 3): the message differs from the tag.
+            r = subprocess.run(
+                self._verify_argv(name="hello"),
+                stdout=sink, stderr=subprocess.PIPE)
+            self.assertEqual(r.returncode, 3,
+                             f"mismatch must stay exit 3; "
+                             f"stderr={r.stderr!r}")
+            self.assertIn(b"mismatch", r.stderr.lower())
+            self.assertNotIn(STDOUT_WRITE_FAILURE, r.stderr)
+
+            # Parameter error (exit 2): malformed tag, checked before the
+            # file is even opened.
+            r = subprocess.run(
+                self._verify_argv(tag_hex="abc"),
+                stdout=sink, stderr=subprocess.PIPE)
+            self.assertEqual(r.returncode, 2,
+                             f"parameter error must stay exit 2; "
+                             f"stderr={r.stderr!r}")
+            self.assertIn(b"invalid --tag-hex", r.stderr)
+            self.assertNotIn(STDOUT_WRITE_FAILURE, r.stderr)
+
+            # Read failure (exit 1): no OK is ever produced.
+            r = subprocess.run(
+                [self.exe, "verify", "--key-hex", "0001", "--file", missing,
+                 "--tag-hex", self.GOOD_TAG],
+                stdout=sink, stderr=subprocess.PIPE)
+            self.assertEqual(r.returncode, 1,
+                             f"read failure must stay exit 1; "
+                             f"stderr={r.stderr!r}")
+            self.assertIn(b"failed to read file", r.stderr)
+            self.assertNotIn(STDOUT_WRITE_FAILURE, r.stderr)
+            self.assertTrue(r.stdout in (None, b""))
+
 
 def main():
-    if len(sys.argv) not in (2, 3):
+    if len(sys.argv) not in (2, 3, 4):
         print("usage: regression_test.py /path/to/messagetag "
-              "[/path/to/libread_fault_shim.so]", file=sys.stderr)
+              "[/path/to/libread_fault_shim.so] "
+              "[/path/to/libwrite_fault_shim.so]", file=sys.stderr)
         return 2
     TagRegression.exe = os.path.abspath(sys.argv[1])
     TagRegression.tmpdir = None
     TagRegression.shim_path = (os.path.abspath(sys.argv[2])
-                               if len(sys.argv) == 3 else None)
+                               if len(sys.argv) >= 3 else None)
+    TagRegression.write_shim_path = (os.path.abspath(sys.argv[3])
+                                     if len(sys.argv) == 4 else None)
     VerifyRegression.exe = TagRegression.exe
     VerifyRegression.tmpdir = None
     VerifyRegression.shim_path = TagRegression.shim_path
+    VerifyRegression.write_shim_path = TagRegression.write_shim_path
     argv = [sys.argv[0], "-v"]
     # unittest's TextTestRunner gives non-zero exit when a test fails.
     loader = unittest.defaultTestLoader

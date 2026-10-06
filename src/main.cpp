@@ -19,6 +19,10 @@
 #include <string_view>
 #include <vector>
 
+#if defined(__unix__) || defined(__APPLE__)
+#include <csignal>
+#endif
+
 namespace {
 
 constexpr std::string_view kTagUsage =
@@ -67,6 +71,37 @@ std::string hexEncode(const unsigned char* data, std::size_t length) {
         out[2 * i + 1] = kHex[data[i] & 0x0F];
     }
     return out;
+}
+
+// Write the complete one-line success result (the 64-hex-char tag for
+// `tag`, "OK" for `verify`) to standard output. A correct computation or a
+// successful comparison is not success by itself: the whole line, including
+// anything still held in the stream's user-level buffer, must actually have
+// been handed to the operating system. The insertion and the explicit flush
+// are therefore both checked; on failure no retry or second result line is
+// attempted (some bytes may already have reached the recipient, and those
+// remnants are never presented as a usable result) and the caller reports a
+// single output-stage diagnostic and exits 1.
+bool writeResultLine(std::string_view line) {
+    std::cout << line << '\n';
+    if (!std::cout.good()) {
+        return false;
+    }
+    std::cout.flush();
+    return !std::cout.fail() && !std::cout.bad();
+}
+
+// The single diagnostic for a failure that happened while delivering the
+// result line: the destination ran out of space, reported a device error or
+// closed the reading end of a pipe. It is deliberately distinct from the
+// read, key-format and mismatch diagnostics, never names the message, key
+// or tag, and carries no usage text or success hint. std::cerr has unitbuf
+// set, so the one line reaches fd 2 immediately even though the process
+// exits right away.
+void emitStdoutWriteFailure() {
+    std::cerr << "messagetag: error: failed to write result to standard "
+                 "output\n";
+    std::cerr.flush();
 }
 
 // Parse options of the form "--name value" starting at argv[2]. On a usage
@@ -252,7 +287,13 @@ int runTag(int argc, char* argv[]) {
             break;
     }
 
-    std::cout << hexEncode(mac.data(), macLength) << '\n';
+    // Success is only complete once the full tag line (including the
+    // stream buffer) has been delivered to standard output; a correct
+    // computation alone does not justify exit 0.
+    if (!writeResultLine(hexEncode(mac.data(), macLength))) {
+        emitStdoutWriteFailure();
+        return 1;
+    }
     return 0;
 }
 
@@ -337,13 +378,34 @@ int runVerify(int argc, char* argv[]) {
         return 3;
     }
 
-    std::cout << "OK\n";
+    // A matching tag is not success until the whole "OK\n" line (including
+    // the stream buffer) has actually been written to standard output.
+    if (!writeResultLine("OK")) {
+        emitStdoutWriteFailure();
+        return 1;
+    }
     return 0;
 }
 
 }  // namespace
 
 int main(int argc, char* argv[]) {
+    // All standard output and diagnostics in this program go through the
+    // C++ streams; the C stdio streams are never used directly. With the
+    // streams/stdio synchronization removed, std::cout manages its own
+    // buffer and writes through the normal libstdc++ path, so the result
+    // line (including its buffer, flushed explicitly after the write) is
+    // what reaches standard output and a failed write surfaces on the
+    // stream as required.
+    std::ios::sync_with_stdio(false);
+#if defined(__unix__) || defined(__APPLE__)
+    // When standard output is a pipe whose reading end has been closed, the
+    // default disposition would terminate the process with SIGPIPE (the
+    // shell then reports a signal death rather than an exit status). The
+    // result-output stage must instead observe the resulting EPIPE write
+    // failure like any other output error: one diagnostic and exit code 1.
+    std::signal(SIGPIPE, SIG_IGN);
+#endif
     if (argc == 2 && std::string_view(argv[1]) == "--version") {
         std::cout << "messagetag 0.1.0\n";
         return 0;
