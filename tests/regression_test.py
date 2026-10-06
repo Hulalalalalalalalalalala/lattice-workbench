@@ -75,6 +75,7 @@ import os
 import re
 import shutil
 import stat
+import time
 import subprocess
 import sys
 import tempfile
@@ -535,6 +536,98 @@ def assert_closed_pipe_failure(case, rc, stderr, secret_hexes=(), label=""):
     for secret in secret_hexes:
         if secret:
             case.assertNotIn(secret.lower().encode(), stderr.lower())
+
+
+# ---------------------------------------------------------------------------
+# Standard-input (--file -) drivers
+# ---------------------------------------------------------------------------
+
+STDIN_READ_FAIL_MARKER = b"failed to read standard input"
+
+
+def run_feeding_stdin(argv, data, chunk, env=None):
+    """Run ``argv`` (a --file - command) with ``data`` delivered to its
+    standard input in writes of at most ``chunk`` bytes, so the message
+    arrives in many pieces whose boundaries are unrelated to the program's
+    64 KiB read size. Returns (process, stdout, stderr); the split of the
+    writes must not change the result."""
+    r, w = os.pipe()
+    p = subprocess.Popen(argv, stdin=r, stdout=subprocess.PIPE,
+                         stderr=subprocess.PIPE, env=env)
+    os.close(r)
+    try:
+        for pos in range(0, len(data), chunk):
+            os.write(w, data[pos:pos + chunk])
+    finally:
+        os.close(w)
+    out, err = p.communicate(timeout=60)
+    return p, out, err
+
+
+def run_param_error_with_open_stdin(argv, env=None):
+    """Run ``argv`` while standard input is a pipe whose write end the
+    driver keeps open and never closes, so a command that wrongly starts
+    reading before validating parameters blocks forever. A correct command
+    reports its parameter error (exit 2, empty stdout) without waiting.
+    Returns (returncode, stdout, stderr); fails the test on a timeout."""
+    r, w = os.pipe()
+    p = subprocess.Popen(argv, stdin=r, stdout=subprocess.PIPE,
+                         stderr=subprocess.PIPE, env=env)
+    os.close(r)
+    try:
+        out, err = p.communicate(timeout=10)
+    except subprocess.TimeoutExpired:
+        p.kill()
+        p.communicate()
+        raise AssertionError(
+            "process blocked waiting for standard input despite a parameter "
+            f"error: {argv[2:]}")
+    finally:
+        os.close(w)
+    return p.returncode, out, err
+
+
+def drain_nowait(fd):
+    """Whatever is readable on ``fd`` without blocking, or None when nothing
+    is available right now."""
+    os.set_blocking(fd, False)
+    try:
+        chunks = []
+        while True:
+            try:
+                part = os.read(fd, 4096)
+            except BlockingIOError:
+                return None if not chunks else b"".join(chunks)
+            if not part:
+                return b"".join(chunks) if chunks else b""
+            chunks.append(part)
+    finally:
+        os.set_blocking(fd, True)
+
+
+def run_stdin_read_fault(exe, shim, argv, target_path, fail_after, data=None):
+    """Run a --file - command under the read-fault shim with standard input
+    redirected from the regular file ``target_path`` (the shim locates fd 0
+    through /proc/self/fd), delivering ``fail_after`` bytes and then failing
+    the next read. ``data`` is only used to materialize the file."""
+    env = dict(os.environ)
+    env["LD_PRELOAD"] = shim
+    env["MESSAGETAG_READ_FAULT_PATH"] = target_path
+    env["MESSAGETAG_READ_FAULT_AFTER"] = str(fail_after)
+    with open(target_path, "rb") as feed:
+        return subprocess.run(argv, stdin=feed, capture_output=True, env=env)
+
+
+def run_with_closed_stdin(argv):
+    """Start the child with file descriptor 0 closed, so its first read of
+    standard input fails (EBADF) rather than reaching an EOF. The parent
+    still owns the pipe write end that Popen(..., stdin=PIPE) created; the
+    child closes the read end it dup'd onto fd 0 before exec'ing."""
+    p = subprocess.Popen(argv, stdin=subprocess.PIPE,
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                         preexec_fn=lambda: os.close(0))
+    out, err = p.communicate()
+    return p.returncode, out, err
 
 
 class TagRegression(unittest.TestCase):
@@ -1156,7 +1249,160 @@ class TagRegression(unittest.TestCase):
                     self, self.tag_argv(), steps, self.tmpdir, self.TAG_LINE,
                     secret_hexes=("0001",), label=f"tag steps={steps}")
 
+    # -- standard input (--file -) -----------------------------------------
 
+    def tag_stdin_argv(self, key_hex="0001"):
+        return [self.exe, "tag", "--key-hex", key_hex, "--file", "-"]
+
+    def test_100_stdin_matches_file_for_same_bytes(self):
+        """The tag for bytes from standard input equals the tag for the same
+        bytes in a file, across empty, NUL-containing, newline variants,
+        and multi-chunk messages whose length is/isn't aligned to 64 KiB."""
+        messages = [
+            b"",
+            b"hello\n",
+            b"hello",
+            b"hello\r\n",
+            b"\x00bytes-after-nul",
+            b"a\nb",
+            large_bytes(),                       # 131195, ragged tail
+            stream_bytes(1 * READ_CHUNK),       # exact chunk multiple
+            stream_bytes(2 * READ_CHUNK + 7),
+            stream_bytes(3 * READ_CHUNK - 1),
+        ]
+        for key in ("0001", LARGE_KEY_HEX):
+            for i, data in enumerate(messages):
+                with self.subTest(i=i, key=key, n=len(data)):
+                    expected = expected_hmac(key, data)
+                    for chunk in (1, 37, 65536, 1 << 20):
+                        p, out, err = run_feeding_stdin(
+                            self.tag_stdin_argv(key), data, chunk)
+                        self.assertEqual(
+                            p.returncode, 0,
+                            f"chunk={chunk} stderr={err!r}")
+                        self.assertEqual(err, b"")
+                        self.assertEqual(out, expected.encode() + b"\n")
+
+    def test_101_empty_stdin_is_empty_message(self):
+        p, out, err = run_feeding_stdin(self.tag_stdin_argv(), b"", 1)
+        self.assertEqual(p.returncode, 0, err)
+        self.assertEqual(err, b"")
+        self.assertEqual(out,
+                         expected_hmac("0001", b"").encode() + b"\n")
+
+    def test_102_chunked_arrival_does_not_change_tag(self):
+        """A multi-64KiB message delivered one awkward chunk at a time (with
+        the pipe closed only at the real end) authenticates the same bytes
+        as one-shot input. This is the 'arrival split must not matter'
+        case."""
+        data = bytes((i * 13 + 11) % 256
+                     for i in range(3 * READ_CHUNK + 17))
+        p, out, err = run_feeding_stdin(
+            self.tag_stdin_argv(LARGE_KEY_HEX), data, 4099)
+        self.assertEqual(p.returncode, 0, err)
+        self.assertEqual(err, b"")
+        self.assertEqual(out, expected_hmac(LARGE_KEY_HEX, data).encode()
+                         + b"\n")
+
+    def test_103_no_output_before_stdin_ends(self):
+        """The tag must not appear while the upstream is still open, even
+        after bytes have arrived; it appears only once input ends."""
+        r, w = os.pipe()
+        ro, we = os.pipe()
+        p = subprocess.Popen(self.tag_stdin_argv(), stdin=r, stdout=we)
+        os.close(r)
+        os.close(we)
+        try:
+            os.write(w, b"hello\n")
+            time.sleep(0.3)
+            early = drain_nowait(ro)
+            self.assertIsNone(
+                early,
+                f"tag emitted before stdin ended: {early!r}")
+            os.close(w)
+            # stdout was a raw pipe fd, so read it to EOF and reap manually.
+            chunks = []
+            while True:
+                part = os.read(ro, 4096)
+                if not part:
+                    break
+                chunks.append(part)
+            p.wait(timeout=20)
+            self.assertEqual(b"".join(chunks),
+                             expected_hmac("0001", b"hello\n").encode()
+                             + b"\n")
+            self.assertEqual(p.returncode, 0)
+        finally:
+            os.close(ro)
+            if p.poll() is None:
+                p.kill()
+
+    def test_104_minus_file_still_opened_as_file(self):
+        """Only the exact single-character value '-' means standard input;
+        a real file named '-' is reached through ./- and an absolute path."""
+        hello_tag = expected_hmac("0001", b"hello\n")
+        path = os.path.join(self.tmpdir, "-")
+        with open(path, "wb") as f:
+            f.write(b"hello\n")
+        for value in ("./-", path):
+            with self.subTest(value=value):
+                r = subprocess.run(
+                    [self.exe, "tag", "--key-hex", "0001", "--file", value],
+                    capture_output=True, cwd=self.tmpdir)
+                self.assertTagSuccess(r, hello_tag, value)
+
+    def test_105_param_errors_reported_before_reading_stdin(self):
+        """Bad key, a missing required option, and an unknown argument exit 2
+        without consuming (or waiting for) standard input, even though the
+        upstream stays open the whole time."""
+        invocations = [
+            [self.exe, "tag", "--key-hex", "zz", "--file", "-"],
+            [self.exe, "tag", "--key-hex", "0001"],
+            [self.exe, "tag", "--file", "-"],
+            [self.exe, "tag", "--key-hex", "0001", "--bogus", "x",
+             "--file", "-"],
+            [self.exe, "tag", "--key-hex", "--file", "-"],
+        ]
+        for argv in invocations:
+            with self.subTest(argv=argv[2:]):
+                rc, out, err = run_param_error_with_open_stdin(argv)
+                self.assertEqual(rc, 2, f"{argv[2:]}: {err!r}")
+                self.assertEqual(out, b"")
+                self.assertIn(b"Usage: messagetag tag", err)
+
+    def test_106_stdin_read_failure_after_prefix_exits_1(self):
+        """A read error on standard input after a non-empty prefix: no tag,
+        exit 1, a standard-input read diagnostic, exit 1 -- and the
+        prefix's own valid tag must not be produced."""
+        if self.shim is None:
+            self.skipTest("read-fault shim not available (build with CMake "
+                          "or pass its path as the second argument)")
+        if not os.path.exists("/proc/self/fd"):
+            self.skipTest("read-fault shim needs /proc/self/fd (Linux)")
+        data = stream_bytes(READ_CHUNK + 5000)
+        target = os.path.join(self.tmpdir, "stdin-fault.bin")
+        with open(target, "wb") as f:
+            f.write(data)
+        for fail_after in (1, 5000, READ_CHUNK, len(data) - 1):
+            with self.subTest(fail_after=fail_after):
+                result = run_stdin_read_fault(
+                    self.exe, self.shim, self.tag_stdin_argv(), target,
+                    fail_after)
+                self.assertEqual(
+                    result.returncode, 1,
+                    f"fail_after={fail_after}: {result.stderr!r}")
+                self.assertEqual(result.stdout, b"")
+                self.assertIn(STDIN_READ_FAIL_MARKER, result.stderr.lower())
+                self.assertNotRegex(result.stderr, rb"[0-9a-f]{64}")
+
+    def test_107_closed_stdin_is_read_failure(self):
+        """Standard input that cannot be read at all (fd 0 closed) is a read
+        failure: exit 1, empty stdout, a standard-input diagnostic."""
+        rc, out, err = run_with_closed_stdin(self.tag_stdin_argv())
+        self.assertEqual(rc, 1, err)
+        self.assertEqual(out, b"")
+        self.assertIn(STDIN_READ_FAIL_MARKER, err.lower())
+        self.assertNotRegex(err, rb"[0-9a-f]{64}")
 
     # -- entry-point compatibility -----------------------------------------
 
@@ -1738,6 +1984,174 @@ class VerifyRegression(unittest.TestCase):
                     self, self.verify_argv(), steps, self.tmpdir,
                     self.OK_LINE, secret_hexes=("0001", self.GOOD_TAG),
                     label=f"verify steps={steps}")
+
+    # -- standard input (--file -) -----------------------------------------
+
+    def verify_stdin_argv(self, key_hex="0001", tag_hex=None):
+        if tag_hex is None:
+            tag_hex = self.GOOD_TAG
+        return [self.exe, "verify", "--key-hex", key_hex, "--file", "-",
+                "--tag-hex", tag_hex]
+
+    def test_200_stdin_verify_matches_file_vectors(self):
+        """verify over standard input accepts exactly the same independently
+        computed tags as verify over the file, for the same bytes: empty
+        message, NUL bytes, newline forms and multi-chunk lengths, chunked
+        arrival notwithstanding."""
+        cases = [
+            ("0001", b""),
+            ("0001", b"hello\n"),
+            ("0001", b"hello"),
+            ("0001", b"\x00bytes-after-nul"),
+            (LARGE_KEY_HEX, large_bytes()),
+            (LARGE_KEY_HEX, stream_bytes(2 * READ_CHUNK)),
+        ]
+        for key, data in cases:
+            tag = expected_hmac(key, data)
+            for chunk in (1, 37, 1 << 20):
+                with self.subTest(n=len(data), chunk=chunk):
+                    p, out, err = run_feeding_stdin(
+                        self.verify_stdin_argv(key, tag), data, chunk)
+                    self.assertEqual(p.returncode, 0, err)
+                    self.assertEqual(out, b"OK\n")
+                    self.assertEqual(err, b"")
+
+    def test_201_stdin_mismatch_is_exit_3_empty_stdout(self):
+        """A tag for hello\\n must not verify a standard-input message that
+        differs -- one byte different, the trailing newline missing, or the
+        empty input; exit 3, zero stdout bytes, a mismatch diagnostic that
+        assigns no cause and leaks neither tag nor key."""
+        tag = expected_hmac("0001", b"hello\n")
+        for data in (b"hello", b"hellX\n", b"", b"hello\n\n"):
+            with self.subTest(data=data[:8]):
+                p, out, err = run_feeding_stdin(
+                    self.verify_stdin_argv("0001", tag), data, 4096)
+                self.assertEqual(p.returncode, 3, err)
+                self.assertEqual(out, b"")
+                self.assertIn(b"mismatch", err.lower())
+                # No cause assigned; neither the supplied tag nor the
+                # recomputed tag nor the key may appear on stderr.
+                self.assertNotRegex(err, rb"(?i)[0-9a-f]{64}")
+                self.assertNotIn(tag.encode(), err)
+                self.assertNotIn(b"0001", err)
+
+    def test_202_empty_stdin_verifies_empty_message_tag(self):
+        empty_tag = expected_hmac("0001", b"")
+        p, out, err = run_feeding_stdin(
+            self.verify_stdin_argv("0001", empty_tag), b"", 1)
+        self.assertEqual(p.returncode, 0, err)
+        self.assertEqual(out, b"OK\n")
+        self.assertEqual(err, b"")
+
+    def test_203_no_verdict_before_stdin_ends(self):
+        """Neither OK nor a mismatch may be reported while standard input is
+        still open, even after bytes have arrived."""
+        tag_hello = expected_hmac("0001", b"hello\n")
+        tag_prefix = expected_hmac("0001", b"hel")
+        for supplied in (tag_hello, tag_prefix):
+            with self.subTest(supplied=supplied[:8]):
+                r, w = os.pipe()
+                ro, we = os.pipe()
+                p = subprocess.Popen(
+                    self.verify_stdin_argv("0001", supplied),
+                    stdin=r, stdout=we)
+                os.close(r)
+                os.close(we)
+                try:
+                    os.write(w, b"hel")
+                    time.sleep(0.3)
+                    self.assertIsNone(drain_nowait(ro))
+                    os.close(w)
+                    # stdout was a raw pipe fd, so read it to EOF and reap
+                    # manually. The full message was just b"hel": its tag
+                    # passes, the hello\n tag mismatches -- either way,
+                    # nothing may have appeared early.
+                    chunks = []
+                    while True:
+                        part = os.read(ro, 4096)
+                        if not part:
+                            break
+                        chunks.append(part)
+                    p.wait(timeout=20)
+                    out = b"".join(chunks)
+                    self.assertIn(p.returncode, (0, 3))
+                    if p.returncode == 0:
+                        self.assertEqual(out, b"OK\n")
+                    else:
+                        self.assertEqual(out, b"")
+                finally:
+                    os.close(ro)
+                    if p.poll() is None:
+                        p.kill()
+
+    def test_204_param_errors_reported_before_reading_stdin(self):
+        """Invalid tag, invalid key, and a missing --tag-hex exit 2 while the
+        upstream pipe stays open: verify must not wait for message bytes."""
+        good = self.GOOD_TAG
+        invocations = [
+            self.verify_stdin_argv("0001", "abc"),
+            self.verify_stdin_argv("0001", good + " "),
+            self.verify_stdin_argv("zz", good),
+            [self.exe, "verify", "--key-hex", "0001", "--file", "-"],
+            [self.exe, "verify", "--key-hex", "0001", "--file", "-",
+             "--tag-hex"],
+            [self.exe, "verify", "--file", "-", "--tag-hex", good],
+        ]
+        for argv in invocations:
+            with self.subTest(argv=argv[2:]):
+                rc, out, err = run_param_error_with_open_stdin(argv)
+                self.assertEqual(rc, 2, f"{argv[2:]}: {err!r}")
+                self.assertEqual(out, b"")
+                self.assertIn(b"Usage: messagetag verify", err)
+
+    def test_205_stdin_read_failure_after_prefix_is_neither_pass_nor_fail(self):
+        """A standard-input read error after a non-empty prefix ends with
+        exit 1, empty stdout and the input-read diagnostic -- whether the
+        supplied tag matches the whole message or only the prefix."""
+        if self.shim is None:
+            self.skipTest("read-fault shim not available (build with CMake "
+                          "or pass its path as the second argument)")
+        if not os.path.exists("/proc/self/fd"):
+            self.skipTest("read-fault shim needs /proc/self/fd (Linux)")
+        data = stream_bytes(READ_CHUNK + 5000)
+        target = os.path.join(self.tmpdir, "stdin-fault-verify.bin")
+        with open(target, "wb") as f:
+            f.write(data)
+        whole_tag = expected_hmac("0001", data)
+        for fail_after in (1, 5000, READ_CHUNK, len(data) - 1):
+            prefix_tag = expected_hmac("0001", data[:fail_after])
+            for supplied, label in ((whole_tag, "whole"), (prefix_tag,
+                                                           "prefix")):
+                with self.subTest(fail_after=fail_after, tag=label):
+                    result = run_stdin_read_fault(
+                        self.exe, self.shim,
+                        self.verify_stdin_argv("0001", supplied), target,
+                        fail_after)
+                    self.assertEqual(result.returncode, 1, result.stderr)
+                    self.assertEqual(result.stdout, b"")
+                    self.assertIn(STDIN_READ_FAIL_MARKER,
+                                  result.stderr.lower())
+                    self.assertNotRegex(result.stderr, rb"(?i)[0-9a-f]{64}")
+
+    def test_206_closed_stdin_is_read_failure(self):
+        rc, out, err = run_with_closed_stdin(
+            self.verify_stdin_argv("0001", self.GOOD_TAG))
+        self.assertEqual(rc, 1, err)
+        self.assertEqual(out, b"")
+        self.assertIn(STDIN_READ_FAIL_MARKER, err.lower())
+        self.assertNotRegex(err, rb"(?i)[0-9a-f]{64}")
+
+    def test_207_minus_file_still_verified_as_file(self):
+        """A real file named '-' is verified through ./- rather than via
+        standard input."""
+        path = os.path.join(self.tmpdir, "-")
+        with open(path, "wb") as f:
+            f.write(b"hello\n")
+        r = subprocess.run(
+            [self.exe, "verify", "--key-hex", "0001", "--file", "./-",
+             "--tag-hex", self.GOOD_TAG],
+            capture_output=True, cwd=self.tmpdir)
+        self.assertVerifyOk(r, "file named - via ./")
 
 
 def main():

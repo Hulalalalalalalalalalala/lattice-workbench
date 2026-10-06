@@ -3,8 +3,8 @@
 // OpenSSL 3.x marks them deprecated in favour of the EVP_MAC interface
 // (which 1.1.1 does not have); suppress those deprecation warnings so the
 // portable interface builds cleanly on 3.x. The streaming Init/Update/
-// Final form lets the message file be digested in fixed-size chunks
-// instead of being held in memory all at once.
+// Final form lets the message (file or standard input) be digested in
+// fixed-size chunks instead of being held in memory all at once.
 #define OPENSSL_SUPPRESS_DEPRECATED
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
@@ -27,11 +27,18 @@
 namespace {
 
 constexpr std::string_view kTagUsage =
-    "Usage: messagetag tag --key-hex <hex-key> --file <message-file>\n";
+    "Usage: messagetag tag --key-hex <hex-key> --file <message-file|->\n";
 
 constexpr std::string_view kVerifyUsage =
-    "Usage: messagetag verify --key-hex <hex-key> --file <message-file> "
+    "Usage: messagetag verify --key-hex <hex-key> --file <message-file|-> "
     "--tag-hex <hex-tag>\n";
+
+// A --file value of exactly this single character selects standard input:
+// every byte read from file descriptor 0 until its normal end is the one
+// message. Anything else (including "./-", an absolute path ending in "/-"
+// or a value with surrounding characters) is a plain file path, so a real
+// file named "-" stays reachable.
+constexpr std::string_view kStdinFile = "-";
 
 // Per-command identity for the shared option/prepare/authenticate flow:
 // the name spliced into diagnostics, that command's own usage line and
@@ -222,20 +229,83 @@ bool parseKey(const CommandSpec& spec, const std::string& keyHex,
     return false;
 }
 
-// Stream the message file into HMAC-SHA-256 a fixed-size chunk at a time.
-// The message is never stored whole: regardless of file length, only one
+// Stream a message into HMAC-SHA-256 a fixed-size chunk at a time. The
+// message is never stored whole: regardless of its total length, only one
 // 64 KiB read buffer is needed on top of the constant-size HMAC context.
+// This holds for both a file and standard input, so a piped-in message can
+// be arbitrarily large without memory use growing with its length.
 //
-// The bytes are not interpreted as text: the file is opened in binary mode,
+// The bytes are not interpreted as text: the source is read in binary mode,
 // trailing newlines are kept, line endings are not converted and zero bytes
-// are preserved. An empty file simply yields no Update calls, which
+// are preserved. An empty message (an empty file, or standard input that
+// ends before any byte arrives) simply yields no Update calls, which
 // authenticates the empty message.
 enum class HmacStatus { kSuccess, kReadError, kCryptoError };
 
-HmacStatus hmacSha256File(const std::vector<unsigned char>& key,
-                          const std::string& path,
-                          std::array<unsigned char, EVP_MAX_MD_SIZE>& mac,
-                          std::size_t& macLength) {
+// Feed one already-read byte range into the context. Anything but a
+// complete update is a crypto failure.
+HmacStatus updateHmac(HMAC_CTX* ctx, const unsigned char* data,
+                      std::size_t length) {
+    if (length == 0) {
+        return HmacStatus::kSuccess;
+    }
+    if (HMAC_Update(ctx, data, length) != 1) {
+        return HmacStatus::kCryptoError;
+    }
+    return HmacStatus::kSuccess;
+}
+
+// Read loop shared by the file and standard-input sources: pull up to the
+// buffer size per iteration and feed every byte that actually arrived,
+// stopping only at the source's normal end. `readOnce` returns a positive
+// byte count, 0 at the normal end, or -1 with errno set on a read error.
+// A read error (including one that happens after a non-empty prefix has
+// already been fed to HMAC) aborts authentication: the caller never calls
+// Final, so no partial-message tag can be produced. EINTR from a read that
+// delivered nothing is retried; a short read is ordinary and simply
+// continues the loop, so how the bytes are split across arrivals cannot
+// change the result. On a read error the failing errno is captured into
+// `readErrno` straight away -- before any later teardown (e.g. freeing the
+// HMAC context) can clobber it -- so the caller's diagnostic can state the
+// reason.
+template <typename ReadOnce>
+HmacStatus streamHmac(HMAC_CTX* ctx, std::array<char, 65536>& buffer,
+                      ReadOnce readOnce, int& readErrno) {
+    while (true) {
+        ssize_t got = readOnce(buffer.data(), buffer.size());
+        if (got > 0) {
+            HmacStatus update = updateHmac(
+                ctx, reinterpret_cast<const unsigned char*>(buffer.data()),
+                static_cast<std::size_t>(got));
+            if (update != HmacStatus::kSuccess) {
+                return update;
+            }
+            continue;
+        }
+        if (got == 0) {
+            return HmacStatus::kSuccess;  // normal end of the message
+        }
+        int failedErrno = errno;
+        if (failedErrno == EINTR) {
+            continue;
+        }
+        readErrno = failedErrno;
+        return HmacStatus::kReadError;
+    }
+}
+
+// Stream either a file or standard input. When `fromStdin` is set, file
+// descriptor 0 is read with read(2) directly rather than through a C++
+// stream so read errors are observable (an std::ifstream cannot attach to
+// fd 0 portably, and errno is what distinguishes a real failure from a
+// clean EOF or an EINTR). No prompt is ever written and the message is
+// read to its normal end before returning. On a read error `readErrno`
+// receives the errno captured at the failing read.
+HmacStatus hmacSha256Source(
+    const std::vector<unsigned char>& key, bool fromStdin,
+    const std::string& path,
+    std::array<unsigned char, EVP_MAX_MD_SIZE>& mac,
+    std::size_t& macLength, int& readErrno) {
     HMAC_CTX* rawCtx = HMAC_CTX_new();
     if (rawCtx == nullptr) {
         return HmacStatus::kCryptoError;
@@ -254,32 +324,50 @@ HmacStatus hmacSha256File(const std::vector<unsigned char>& key,
         return HmacStatus::kCryptoError;
     }
 
-    std::ifstream in(path, std::ios::binary | std::ios::in);
-    if (!in) {
-        return HmacStatus::kReadError;
-    }
-
     std::array<char, 65536> buffer{};
-    while (in.read(buffer.data(), static_cast<std::streamsize>(buffer.size()))) {
-        if (HMAC_Update(ctx.get(),
-                        reinterpret_cast<const unsigned char*>(buffer.data()),
-                        static_cast<std::size_t>(in.gcount())) != 1) {
-            return HmacStatus::kCryptoError;
+    HmacStatus readStatus;
+    if (fromStdin) {
+        // File descriptor 0 is consumed exactly as it arrives: no prompt is
+        // written, and no result is emitted before this returns at the
+        // descriptor's normal end. How the bytes are split across reads
+        // (pipe scheduling, redirection chunking) cannot change the tag.
+        readStatus = streamHmac(
+            ctx.get(), buffer,
+            [](char* buf, std::size_t count) {
+                return ::read(STDIN_FILENO, buf, count);
+            },
+            readErrno);
+    } else {
+        std::ifstream in(path, std::ios::binary | std::ios::in);
+        if (!in) {
+            // Could not open the file; the caller names the path in its own
+            // diagnostic.
+            readErrno = EIO;
+            return HmacStatus::kReadError;
         }
+        // std::ifstream keeps the exact bytes of a binary file; adapt it to
+        // the same read-once shape as fd 0 (positive byte count, 0 at the
+        // clean end, -1 on a read error). The trailing short final read is
+        // just another positive count, so every byte -- including a final
+        // partial chunk -- takes part exactly once.
+        readStatus = streamHmac(
+            ctx.get(), buffer,
+            [&in](char* buf, std::size_t count) -> ssize_t {
+                in.read(buf, static_cast<std::streamsize>(count));
+                std::streamsize got = in.gcount();
+                if (got > 0) {
+                    return static_cast<ssize_t>(got);
+                }
+                if (in.bad()) {
+                    errno = EIO;
+                    return -1;
+                }
+                return 0;  // clean EOF
+            },
+            readErrno);
     }
-    // A read error (including one that happens after part of the message has
-    // already been fed to HMAC) aborts authentication: Final is never called,
-    // so no partial-message tag can be produced. EOF with a short final read
-    // is normal and those remaining bytes must still participate.
-    if (in.bad()) {
-        return HmacStatus::kReadError;
-    }
-    if (in.gcount() > 0) {
-        if (HMAC_Update(ctx.get(),
-                        reinterpret_cast<const unsigned char*>(buffer.data()),
-                        static_cast<std::size_t>(in.gcount())) != 1) {
-            return HmacStatus::kCryptoError;
-        }
+    if (readStatus != HmacStatus::kSuccess) {
+        return readStatus;
     }
 
     unsigned int outLength = 0;
@@ -288,6 +376,17 @@ HmacStatus hmacSha256File(const std::vector<unsigned char>& key,
     }
     macLength = outLength;
     return HmacStatus::kSuccess;
+}
+
+// A path of exactly "-" selects standard input; anything else (including
+// "./-" or an absolute path) names a file, so a real file named "-" stays
+// reachable.
+HmacStatus hmacSha256File(const std::vector<unsigned char>& key,
+                          const std::string& path,
+                          std::array<unsigned char, EVP_MAX_MD_SIZE>& mac,
+                          std::size_t& macLength, int& readErrno) {
+    return hmacSha256Source(key, /*fromStdin=*/path == kStdinFile, path, mac,
+                            macLength, readErrno);
 }
 
 // Output of the shared preparation stage that the command-specific
@@ -307,11 +406,13 @@ struct PreparedAuthentication {
 //   2. require --key-hex/--file, and additionally --tag-hex when
 //      `expectTag` is set (exit 2);
 //   3. decode the key, and the supplied tag for verify, BEFORE the message
-//      file is opened, so a malformed key/tag is a parameter error (exit 2)
-//      even when the file does not exist;
-//   4. stream the whole file through HMAC-SHA-256 (read or computation
-//      failure -> exit 1, with no result produced; a prefix read before a
-//      failure is never finalized as the message).
+//      source is touched, so a malformed key/tag is a parameter error
+//      (exit 2) even when the file does not exist or standard input never
+//      ends;
+//   4. stream the whole message (file or standard input) through
+//      HMAC-SHA-256 (read or computation failure -> exit 1, with no result
+//      produced; a prefix read before a failure is never finalized as the
+//      message).
 //
 // Every diagnostic goes out from here under the failing command's own name
 // and usage, so one and the same failure behaviour no longer has to be kept
@@ -336,9 +437,11 @@ int prepareAuthentication(const CommandSpec& spec, int argc, char* argv[],
     const std::string& keyHex = opts["--key-hex"];
     const std::string& filePath = opts["--file"];
 
-    // All input-format checks happen before the file is opened, so a
-    // malformed key or tag is reported as a parameter error (exit 2) even
-    // when the message file does not exist.
+    // All input-format checks happen before the message source is touched:
+    // before opening a file, and before reading standard input. A malformed
+    // key or tag is therefore reported as a parameter error (exit 2) even
+    // when the file does not exist or standard input's upstream has not
+    // finished, so such a command never blocks waiting for message bytes.
     std::vector<unsigned char> key;
     if (!parseKey(spec, keyHex, key)) {
         return 2;
@@ -361,12 +464,25 @@ int prepareAuthentication(const CommandSpec& spec, int argc, char* argv[],
         }
     }
 
-    switch (hmacSha256File(key, filePath, mac, macLength)) {
+    const bool fromStdin = (filePath == kStdinFile);
+    int readErrno = 0;
+    switch (hmacSha256File(key, filePath, mac, macLength, readErrno)) {
         case HmacStatus::kReadError:
             // The partially read prefix must never be authenticated as if it
-            // were the whole message.
-            std::cerr << "messagetag " << spec.name
-                      << ": error: failed to read file: " << filePath << "\n";
+            // were the whole message. The two sources get their own line: a
+            // file diagnostic names the path, while the standard-input one
+            // says the input read failed and why. Neither echoes the key,
+            // the supplied tag or a recomputed tag.
+            if (fromStdin) {
+                std::cerr << "messagetag " << spec.name
+                          << ": error: failed to read standard input ("
+                          << std::strerror(readErrno != 0 ? readErrno : EIO)
+                          << ")\n";
+            } else {
+                std::cerr << "messagetag " << spec.name
+                          << ": error: failed to read file: " << filePath
+                          << "\n";
+            }
             return 1;
         case HmacStatus::kCryptoError:
             std::cerr << "messagetag " << spec.name
@@ -428,9 +544,11 @@ int runVerify(int argc, char* argv[]) {
         // State only that authentication failed; do not assign a cause (the
         // message, the key or the tag could each be the one that differs),
         // and never print the recomputed tag, a matched prefix or the key.
+        // The message may have come from a file or standard input, so the
+        // wording stays source-neutral.
         std::cerr << "messagetag verify: error: authentication tag mismatch: "
-                     "the supplied tag does not match the given key and file "
-                     "content\n";
+                     "the supplied tag does not match the given key and "
+                     "message content\n";
         return 3;
     }
 
@@ -464,8 +582,8 @@ int main(int argc, char* argv[]) {
     }
     std::cerr << "Usage: messagetag --version\n"
               << "       messagetag tag --key-hex <hex-key> "
-                 "--file <message-file>\n"
+                 "--file <message-file|->\n"
               << "       messagetag verify --key-hex <hex-key> "
-                 "--file <message-file> --tag-hex <hex-tag>\n";
+                 "--file <message-file|-> --tag-hex <hex-tag>\n";
     return 2;
 }
