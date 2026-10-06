@@ -33,6 +33,31 @@ constexpr std::string_view kVerifyUsage =
     "Usage: messagetag verify --key-hex <hex-key> --file <message-file> "
     "--tag-hex <hex-tag>\n";
 
+// Per-command identity for the shared option/prepare/authenticate flow:
+// the name spliced into diagnostics, that command's own usage line and
+// exactly the value-taking options it accepts. Whether a token following
+// an option counts as "missing a value" is decided against this list, so
+// each command keeps judging missing values by its own option set and a
+// diagnostic for one command never carries the other command's usage.
+struct CommandSpec {
+    std::string_view name;
+    std::string_view usage;
+    std::vector<std::string_view> options;
+};
+
+const CommandSpec& tagSpec() {
+    static const CommandSpec spec{
+        "tag", kTagUsage, {"--key-hex", "--file"}};
+    return spec;
+}
+
+const CommandSpec& verifySpec() {
+    static const CommandSpec spec{
+        "verify", kVerifyUsage,
+        {"--key-hex", "--file", "--tag-hex"}};
+    return spec;
+}
+
 // SHA-256 HMAC tags are always 32 bytes / 64 hex characters.
 constexpr std::size_t kTagBytes = 32;
 
@@ -135,12 +160,10 @@ bool emitResultLine(std::string_view command, std::string_view line) {
 // starts with a dash, such as "--notes", and including an explicitly empty
 // string) is taken as the value, so file paths with leading dashes stay
 // usable and empty values keep their own distinct diagnostics.
-bool parseValueOptions(int argc, char* argv[], std::string_view command,
-                       std::string_view usage,
-                       const std::vector<std::string_view>& names,
+bool parseValueOptions(const CommandSpec& spec, int argc, char* argv[],
                        std::map<std::string, std::string>& values) {
-    auto isOptionName = [&names](std::string_view arg) {
-        for (std::string_view name : names) {
+    auto isOptionName = [&spec](std::string_view arg) {
+        for (std::string_view name : spec.options) {
             if (arg == name) {
                 return true;
             }
@@ -150,9 +173,9 @@ bool parseValueOptions(int argc, char* argv[], std::string_view command,
     for (int i = 2; i < argc; ++i) {
         std::string arg(argv[i]);
         if (!isOptionName(arg)) {
-            std::cerr << "messagetag " << command
+            std::cerr << "messagetag " << spec.name
                       << ": error: unknown argument '" << arg << "'\n"
-                      << usage;
+                      << spec.usage;
             return false;
         }
         // The diagnostic names only the option that lacks a value; the
@@ -160,10 +183,10 @@ bool parseValueOptions(int argc, char* argv[], std::string_view command,
         // never spliced into the message, and neither is any key or tag
         // material supplied elsewhere on the command line.
         if (i + 1 >= argc || isOptionName(argv[i + 1])) {
-            std::cerr << "messagetag " << command
+            std::cerr << "messagetag " << spec.name
                       << ": error: option '" << arg
                       << "' requires a value\n"
-                      << usage;
+                      << spec.usage;
             return false;
         }
         values[arg] = argv[++i];
@@ -171,13 +194,13 @@ bool parseValueOptions(int argc, char* argv[], std::string_view command,
     return true;
 }
 
-bool requireOption(const std::map<std::string, std::string>& values,
-                   std::string_view command, std::string_view usage,
+bool requireOption(const CommandSpec& spec,
+                   const std::map<std::string, std::string>& values,
                    std::string_view name) {
     if (values.find(std::string(name)) == values.end()) {
-        std::cerr << "messagetag " << command
+        std::cerr << "messagetag " << spec.name
                   << ": error: missing required option '" << name << "'\n"
-                  << usage;
+                  << spec.usage;
         return false;
     }
     return true;
@@ -185,17 +208,17 @@ bool requireOption(const std::map<std::string, std::string>& values,
 
 // Decode the --key-hex argument, emitting the shared key-format diagnostic
 // (which never echoes the submitted key) on failure.
-bool parseKey(std::string_view command, std::string_view usage,
-              const std::string& keyHex, std::vector<unsigned char>& key) {
+bool parseKey(const CommandSpec& spec, const std::string& keyHex,
+              std::vector<unsigned char>& key) {
     if (decodeHex(keyHex, key)) {
         return true;
     }
-    std::cerr << "messagetag " << command
+    std::cerr << "messagetag " << spec.name
               << ": error: invalid --key-hex: expected a non-empty, "
                  "even-length string of hexadecimal characters (0-9, a-f, A-F); "
                  "every two characters denote one key byte and leading zeros must "
                  "be kept; a 0x prefix and whitespace are not accepted\n"
-              << usage;
+              << spec.usage;
     return false;
 }
 
@@ -267,38 +290,102 @@ HmacStatus hmacSha256File(const std::vector<unsigned char>& key,
     return HmacStatus::kSuccess;
 }
 
-int runTag(int argc, char* argv[]) {
-    // argv[1] is the "tag" subcommand name; option parsing starts at argv[2].
+// Output of the shared preparation stage that the command-specific
+// decision still needs afterwards.
+struct PreparedAuthentication {
+    // verify only: the supplied --tag-hex decoded to 32 bytes; unused by
+    // tag, which has no tag to compare against.
+    std::vector<unsigned char> expectedTag;
+};
+
+// Prepare and perform the message authentication that both commands share.
+// This is the single place that maintains the ordered checks leading up to
+// the command-specific result:
+//
+//   1. parse exactly this command's value-taking options (unknown argument
+//      or missing value -> exit 2 with that command's usage);
+//   2. require --key-hex/--file, and additionally --tag-hex when
+//      `expectTag` is set (exit 2);
+//   3. decode the key, and the supplied tag for verify, BEFORE the message
+//      file is opened, so a malformed key/tag is a parameter error (exit 2)
+//      even when the file does not exist;
+//   4. stream the whole file through HMAC-SHA-256 (read or computation
+//      failure -> exit 1, with no result produced; a prefix read before a
+//      failure is never finalized as the message).
+//
+// Every diagnostic goes out from here under the failing command's own name
+// and usage, so one and the same failure behaviour no longer has to be kept
+// in sync between runTag and runVerify. Returns the process exit code; on
+// success it is 0 and `mac`/`macLength` (plus `prepared` for verify) hold
+// what the caller needs for its own result handling; otherwise the caller
+// returns the non-zero code unchanged.
+int prepareAuthentication(const CommandSpec& spec, int argc, char* argv[],
+                          bool expectTag,
+                          std::array<unsigned char, EVP_MAX_MD_SIZE>& mac,
+                          std::size_t& macLength,
+                          PreparedAuthentication& prepared) {
     std::map<std::string, std::string> opts;
-    if (!parseValueOptions(
-            argc, argv, "tag", kTagUsage,
-            std::vector<std::string_view>{"--key-hex", "--file"}, opts)) {
+    if (!parseValueOptions(spec, argc, argv, opts)) {
         return 2;
     }
-    if (!requireOption(opts, "tag", kTagUsage, "--key-hex") ||
-        !requireOption(opts, "tag", kTagUsage, "--file")) {
+    if (!requireOption(spec, opts, "--key-hex") ||
+        !requireOption(spec, opts, "--file") ||
+        (expectTag && !requireOption(spec, opts, "--tag-hex"))) {
         return 2;
     }
     const std::string& keyHex = opts["--key-hex"];
     const std::string& filePath = opts["--file"];
 
+    // All input-format checks happen before the file is opened, so a
+    // malformed key or tag is reported as a parameter error (exit 2) even
+    // when the message file does not exist.
     std::vector<unsigned char> key;
-    if (!parseKey("tag", kTagUsage, keyHex, key)) {
+    if (!parseKey(spec, keyHex, key)) {
         return 2;
     }
 
-    std::array<unsigned char, EVP_MAX_MD_SIZE> mac{};
-    std::size_t macLength = 0;
+    if (expectTag) {
+        // The supplied tag must decode to exactly 32 bytes (64 hex
+        // characters); decodeHex already rejects empty input, odd length,
+        // non-hex characters and whitespace, which also rules out a 0x
+        // prefix. The submitted tag is deliberately not echoed back.
+        if (!decodeHex(opts["--tag-hex"], prepared.expectedTag) ||
+            prepared.expectedTag.size() != kTagBytes) {
+            std::cerr << "messagetag " << spec.name
+                      << ": error: invalid --tag-hex: expected exactly 64 "
+                         "hexadecimal characters denoting 32 bytes (0-9, a-f, "
+                         "A-F); empty, truncated or over-long values, embedded "
+                         "whitespace and a 0x prefix are not accepted\n"
+                      << spec.usage;
+            return 2;
+        }
+    }
+
     switch (hmacSha256File(key, filePath, mac, macLength)) {
         case HmacStatus::kReadError:
-            std::cerr << "messagetag tag: error: failed to read file: "
-                      << filePath << "\n";
+            // The partially read prefix must never be authenticated as if it
+            // were the whole message.
+            std::cerr << "messagetag " << spec.name
+                      << ": error: failed to read file: " << filePath << "\n";
             return 1;
         case HmacStatus::kCryptoError:
-            std::cerr << "messagetag tag: error: HMAC-SHA-256 computation failed\n";
+            std::cerr << "messagetag " << spec.name
+                      << ": error: HMAC-SHA-256 computation failed\n";
             return 1;
         case HmacStatus::kSuccess:
-            break;
+            return 0;
+    }
+    return 1;  // unreachable: every status is handled above
+}
+
+int runTag(int argc, char* argv[]) {
+    std::array<unsigned char, EVP_MAX_MD_SIZE> mac{};
+    std::size_t macLength = 0;
+    PreparedAuthentication prepared;
+    int rc = prepareAuthentication(tagSpec(), argc, argv, /*expectTag=*/false,
+                                   mac, macLength, prepared);
+    if (rc != 0) {
+        return rc;
     }
 
     std::string tagLine = hexEncode(mac.data(), macLength);
@@ -325,64 +412,19 @@ bool constantTimeEqual(const unsigned char* a, const unsigned char* b,
 }
 
 int runVerify(int argc, char* argv[]) {
-    // argv[1] is the "verify" subcommand name; parsing starts at argv[2].
-    std::map<std::string, std::string> opts;
-    if (!parseValueOptions(
-            argc, argv, "verify", kVerifyUsage,
-            std::vector<std::string_view>{"--key-hex", "--file", "--tag-hex"},
-            opts)) {
-        return 2;
-    }
-    if (!requireOption(opts, "verify", kVerifyUsage, "--key-hex") ||
-        !requireOption(opts, "verify", kVerifyUsage, "--file") ||
-        !requireOption(opts, "verify", kVerifyUsage, "--tag-hex")) {
-        return 2;
-    }
-    const std::string& keyHex = opts["--key-hex"];
-    const std::string& filePath = opts["--file"];
-    const std::string& tagHex = opts["--tag-hex"];
-
-    // All input-format checks happen before the file is opened, so a
-    // malformed key or tag is reported as a parameter error (exit 2) even
-    // when the message file does not exist.
-    std::vector<unsigned char> key;
-    if (!parseKey("verify", kVerifyUsage, keyHex, key)) {
-        return 2;
-    }
-
-    // The supplied tag must decode to exactly 32 bytes (64 hex characters);
-    // decodeHex already rejects empty input, odd length, non-hex characters
-    // and whitespace, which also rules out a 0x prefix. The submitted tag is
-    // deliberately not echoed back.
-    std::vector<unsigned char> expected;
-    if (!decodeHex(tagHex, expected) || expected.size() != kTagBytes) {
-        std::cerr << "messagetag verify: error: invalid --tag-hex: expected "
-                     "exactly 64 hexadecimal characters denoting 32 bytes "
-                     "(0-9, a-f, A-F); empty, truncated or over-long values, "
-                     "embedded whitespace and a 0x prefix are not accepted\n"
-                  << kVerifyUsage;
-        return 2;
-    }
-
     std::array<unsigned char, EVP_MAX_MD_SIZE> mac{};
     std::size_t macLength = 0;
-    switch (hmacSha256File(key, filePath, mac, macLength)) {
-        case HmacStatus::kReadError:
-            // The partially read prefix must never be authenticated as if it
-            // were the whole message.
-            std::cerr << "messagetag verify: error: failed to read file: "
-                      << filePath << "\n";
-            return 1;
-        case HmacStatus::kCryptoError:
-            std::cerr << "messagetag verify: error: HMAC-SHA-256 "
-                         "computation failed\n";
-            return 1;
-        case HmacStatus::kSuccess:
-            break;
+    PreparedAuthentication prepared;
+    int rc = prepareAuthentication(verifySpec(), argc, argv,
+                                   /*expectTag=*/true, mac, macLength,
+                                   prepared);
+    if (rc != 0) {
+        return rc;
     }
 
     if (macLength != kTagBytes ||
-        !constantTimeEqual(mac.data(), expected.data(), kTagBytes)) {
+        !constantTimeEqual(mac.data(), prepared.expectedTag.data(),
+                           kTagBytes)) {
         // State only that authentication failed; do not assign a cause (the
         // message, the key or the tag could each be the one that differs),
         // and never print the recomputed tag, a matched prefix or the key.
