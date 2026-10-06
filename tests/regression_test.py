@@ -61,6 +61,17 @@ matching prefix or the key; the supplied tag must be exactly 64 hex
 characters (the ``tag`` output with its trailing newline removed, no new
 encapsulation); and parameter format is checked before the file is opened.
 
+The ``--file -`` (standard input) suite pins: piped bytes authenticate to
+the same independently computed tags as the same bytes in a file (empty
+input included); bytes arriving in installments give the same tag and
+nothing is output before the input ends; a file literally named ``-``
+stays readable as ``./-`` while ``--file -`` keeps meaning standard input;
+parameter errors are reported (exit 2) without waiting for input that
+never ends; an unreadable standard input, and a read error after a
+non-empty prefix (injected via the read-fault shim with the message file
+as fd 0), are exit 1 with empty stdout and a standard-input read
+diagnostic -- the received prefix is never authenticated as the message.
+
 Usage:
 
     python3 tests/regression_test.py /path/to/messagetag \
@@ -73,6 +84,7 @@ import hashlib
 import hmac as py_hmac
 import os
 import re
+import select
 import shutil
 import stat
 import subprocess
@@ -1740,6 +1752,305 @@ class VerifyRegression(unittest.TestCase):
                     label=f"verify steps={steps}")
 
 
+class StdinRegression(unittest.TestCase):
+    """Contract for ``--file -``: the message comes from standard input.
+
+    Every byte delivered before the normal end of input is authenticated
+    exactly as if it had been read from a file, so the expected tags are
+    the same independently computed constants used by the file suites.
+    """
+
+    exe = None
+    tmpdir = None
+    shim_path = None
+    shim = None
+
+    HELLO_LF_TAG = ("307a25cbcb6cbca48f5dd2b05fd9174c0cf17580f4ea8dd667092f11"
+                    "a77b4d5d")
+
+    @classmethod
+    def setUpClass(cls):
+        if not cls.exe or not os.path.isfile(cls.exe):
+            raise RuntimeError("messagetag executable not found: %r" % cls.exe)
+        cls.tmpdir = tempfile.mkdtemp(prefix="messagetag-stdin-")
+        cls.shim = find_read_fault_shim(cls.shim_path, cls.exe, cls.tmpdir)
+
+    @classmethod
+    def tearDownClass(cls):
+        if cls.tmpdir and os.path.isdir(cls.tmpdir):
+            shutil.rmtree(cls.tmpdir, ignore_errors=True)
+
+    # -- helpers ------------------------------------------------------------
+
+    def run_tag_stdin(self, key_hex, data, *extra, **kwargs):
+        return subprocess.run(
+            [self.exe, "tag", "--key-hex", key_hex, "--file", "-", *extra],
+            input=data, capture_output=True, **kwargs)
+
+    def run_verify_stdin(self, key_hex, data, tag_hex, *extra, **kwargs):
+        return subprocess.run(
+            [self.exe, "verify", "--key-hex", key_hex, "--file", "-",
+             "--tag-hex", tag_hex, *extra],
+            input=data, capture_output=True, **kwargs)
+
+    def assertTagSuccess(self, result, expected_tag, label=""):
+        self.assertEqual(
+            result.returncode, 0,
+            f"{label}: expected exit 0, got {result.returncode}; "
+            f"stderr={result.stderr!r}")
+        self.assertEqual(result.stderr, b"",
+                         f"{label}: stderr must be empty, got {result.stderr!r}")
+        self.assertEqual(result.stdout, expected_tag.encode() + b"\n",
+                         f"{label}: wrong tag, got {result.stdout!r}")
+
+    def assertStdinReadFailure(self, result, label=""):
+        """A standard-input read failure: exit 1, empty stdout, one stderr
+        line that names the standard-input read failure and leaks neither
+        key nor tag material."""
+        self.assertEqual(
+            result.returncode, 1,
+            f"{label}: expected exit 1, got {result.returncode}; "
+            f"stdout={result.stdout!r} stderr={result.stderr!r}")
+        self.assertEqual(result.stdout, b"",
+                         f"{label}: no result may be produced from a "
+                         f"partially read input")
+        self.assertNotEqual(result.stderr, b"",
+                            f"{label}: a read failure must be reported")
+        lower = result.stderr.lower()
+        self.assertIn(b"read", lower,
+                      f"{label}: diagnostic must name the read failure")
+        self.assertIn(b"standard input", lower,
+                      f"{label}: diagnostic must name standard input")
+        self.assertNotRegex(result.stderr, rb"(?i)[0-9a-f]{64}",
+                            f"{label}: stderr must not contain a tag")
+
+    # -- the same bytes give the same tag, from file or standard input ------
+
+    def test_100_stdin_matches_file_and_independent_constants(self):
+        """Piping the fixture bytes through ``--file -`` must reproduce the
+        independently computed constant tags (re-derived via the stdlib in
+        TagRegression.test_00): empty input, NUL bytes and what follows
+        them, every newline form, trailing newlines, messages spanning
+        several read chunks and exact chunk multiples."""
+        names = ["empty", "hello", "hello_lf", "hello_crlf", "hello_cr",
+                 "nul", "nul_truncated", "lf_in_middle", "cr_in_middle",
+                 "large", "large_mid", "block1", "block2", "block3",
+                 "block1_minus", "block1_plus"]
+        vectors = {name: (key, msg, tag)
+                   for name, key, msg, tag in PROJECT_VECTORS}
+        for name in names:
+            key, message, tag = vectors[name]
+            with self.subTest(fixture=name):
+                self.assertTagSuccess(
+                    self.run_tag_stdin(key, message), tag, name)
+
+    def test_101_empty_stdin_is_valid_message(self):
+        """End of input before any byte is the empty message, not an
+        error: the standard empty-message tag is produced."""
+        self.assertTagSuccess(
+            self.run_tag_stdin("0b" * 20, b""),
+            "999a901219f032cd497cadb5e6051e97b6a29ab297bd6ae722bd6062a2f59542")
+
+    def test_102_chunked_arrival_same_tag_and_no_early_output(self):
+        """Bytes arriving in several installments authenticate exactly as
+        the same bytes arriving at once, and nothing is output (and no
+        conclusion is reached) while the input is still open: after a
+        partial write the process must still be waiting with an empty
+        stdout, and only the final close releases the tag line."""
+        data = large_bytes()
+        proc = subprocess.Popen(
+            [self.exe, "tag", "--key-hex", LARGE_KEY_HEX, "--file", "-"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE)
+        try:
+            # Feed the message in uneven pieces that do not line up with
+            # the 64 KiB read buffer.
+            pieces = [data[:1], data[1:65537], data[65537:65537 + 123],
+                      data[65537 + 123:]]
+            for piece in pieces[:3]:
+                proc.stdin.write(piece)
+                proc.stdin.flush()
+            # The message is incomplete: no tag, no exit, no prompt.
+            self.assertIsNone(
+                proc.poll(),
+                "no conclusion may be reached before the input ends")
+            readable, _, _ = select.select([proc.stdout], [], [], 0.5)
+            self.assertEqual(
+                readable, [],
+                "nothing may be written before the input ends")
+            proc.stdin.write(pieces[3])
+            proc.stdin.close()
+            proc.stdin = None  # communicate() must not touch it again
+            stdout, stderr = proc.communicate(timeout=30)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.communicate()
+        self.assertEqual(proc.returncode, 0, f"stderr={stderr!r}")
+        self.assertEqual(stderr, b"")
+        self.assertEqual(stdout, expected_hmac(LARGE_KEY_HEX, data).encode()
+                      + b"\n")
+
+    def test_103_verify_stdin_ok_and_mismatch(self):
+        ok = self.run_verify_stdin("0001", b"hello\n", self.HELLO_LF_TAG)
+        self.assertEqual(ok.returncode, 0, f"stderr={ok.stderr!r}")
+        self.assertEqual(ok.stdout, b"OK\n")
+        self.assertEqual(ok.stderr, b"")
+        # The same tag against different piped bytes is a plain mismatch:
+        # exit 3, empty stdout, no cause assigned.
+        bad = self.run_verify_stdin("0001", b"hello", self.HELLO_LF_TAG)
+        self.assertEqual(bad.returncode, 3, f"stderr={bad.stderr!r}")
+        self.assertEqual(bad.stdout, b"")
+        self.assertIn(b"mismatch", bad.stderr.lower())
+        self.assertNotRegex(bad.stderr, rb"(?i)[0-9a-f]{64}")
+
+    def test_104_dash_named_file_and_stdin_precedence(self):
+        """Only a --file value of exactly "-" selects standard input. A
+        file literally named "-" stays readable as "./-", and "--file -"
+        in the same directory still reads standard input, not that file."""
+        dash_dir = os.path.join(self.tmpdir, "dashdir")
+        os.makedirs(dash_dir, exist_ok=True)
+        with open(os.path.join(dash_dir, "-"), "wb") as f:
+            f.write(b"hello\n")
+        # "./-" reads the file named "-".
+        r = subprocess.run(
+            [self.exe, "tag", "--key-hex", "0001", "--file", "./-"],
+            capture_output=True, cwd=dash_dir)
+        self.assertTagSuccess(r, self.HELLO_LF_TAG, "file named - via ./-")
+        # "--file -" in the very same directory reads standard input:
+        # piping different bytes must give those bytes' tag, not the
+        # file's, and piping the same bytes gives the same tag as the file.
+        via_stdin = self.run_tag_stdin("0001", b"hello\n", cwd=dash_dir)
+        self.assertTagSuccess(via_stdin, self.HELLO_LF_TAG,
+                              "same bytes via stdin")
+        different = self.run_tag_stdin("0001", b"hello", cwd=dash_dir)
+        self.assertTagSuccess(
+            different,
+            "ee44e44a606a62df24b198d7130faa42a53e2aa5db4133210fd7c657aa7bb6ab",
+            "stdin wins over the file named -")
+
+    # -- parameter errors are reported before standard input is read -------
+
+    def test_105_parameter_errors_do_not_wait_for_stdin(self):
+        """An invalid key, an invalid tag or a missing required option is
+        exit 2 with the command's usage even when the upstream never ends
+        its input: the command must not block waiting for the message."""
+        invocations = [
+            [self.exe, "tag", "--key-hex", "zz", "--file", "-"],
+            [self.exe, "tag", "--key-hex", "0001"],          # no --file
+            [self.exe, "tag", "--key-hex", "0001", "--file", "-",
+             "--bogus", "x"],
+            [self.exe, "verify", "--key-hex", "0001", "--file", "-",
+             "--tag-hex", "abc"],
+            [self.exe, "verify", "--key-hex", "zz", "--file", "-",
+             "--tag-hex", self.HELLO_LF_TAG],
+            [self.exe, "verify", "--key-hex", "0001", "--file", "-"],
+        ]
+        for argv in invocations:
+            with self.subTest(argv=argv[2:]):
+                proc = subprocess.Popen(
+                    argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE)
+                try:
+                    # The write end of stdin stays open the whole time; a
+                    # command that tried to read the message first would
+                    # block here.
+                    rc = proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.communicate()
+                    self.fail(f"{argv[2:]}: parameter error must be "
+                              f"reported without waiting for standard input")
+                finally:
+                    if proc.poll() is None:
+                        proc.kill()
+                stdout = proc.stdout.read()
+                stderr = proc.stderr.read()
+                proc.stdin.close()
+                self.assertEqual(rc, 2, f"{argv[2:]}: stderr={stderr!r}")
+                self.assertEqual(stdout, b"")
+                self.assertIn(USAGE_MARKER, stderr)
+
+    # -- standard-input read failures ---------------------------------------
+
+    def test_106_unreadable_stdin_exit_1(self):
+        """A standard input that cannot be read at all (here: a directory
+        handed over as fd 0, so the very first read fails) is exit 1 with
+        empty stdout and a standard-input read diagnostic -- for both
+        commands."""
+        dir_fd = os.open(self.tmpdir, os.O_RDONLY)
+        try:
+            for argv in (
+                [self.exe, "tag", "--key-hex", "0001", "--file", "-"],
+                [self.exe, "verify", "--key-hex", "0001", "--file", "-",
+                 "--tag-hex", self.HELLO_LF_TAG],
+            ):
+                with self.subTest(command=argv[1]):
+                    r = subprocess.run(argv, stdin=dir_fd,
+                                       capture_output=True)
+                    self.assertStdinReadFailure(r, argv[1])
+        finally:
+            os.close(dir_fd)
+
+    def test_107_read_error_after_partial_stdin(self):
+        """Standard input delivers a non-empty prefix and then fails: the
+        received prefix must never be authenticated as the whole message.
+        tag must not print the prefix's (perfectly valid) tag; verify must
+        neither accept the prefix's tag nor report a mismatch against the
+        whole message's tag -- both are exit 1 with empty stdout."""
+        if self.shim is None:
+            self.skipTest("read-fault shim not available (build with CMake "
+                          "or pass its path as the second argument)")
+        if not os.path.exists("/proc/self/fd"):
+            self.skipTest("read-fault shim needs /proc/self/fd (Linux)")
+
+        data = stream_bytes(READ_CHUNK + 5000)
+        path = os.path.join(self.tmpdir, "stdin-midread.bin")
+        with open(path, "wb") as f:
+            f.write(data)
+        whole_tag = expected_hmac("0001", data)
+
+        env = dict(os.environ)
+        env["LD_PRELOAD"] = self.shim
+        env["MESSAGETAG_READ_FAULT_PATH"] = path
+
+        def run_injected(argv, fail_after):
+            env["MESSAGETAG_READ_FAULT_AFTER"] = str(fail_after)
+            fd = os.open(path, os.O_RDONLY)
+            try:
+                return subprocess.run(argv, stdin=fd, capture_output=True,
+                                      env=env)
+            finally:
+                os.close(fd)
+
+        for fail_after in (1, 5000, READ_CHUNK, len(data) - 1):
+            prefix_tag = expected_hmac("0001", data[:fail_after])
+            with self.subTest(fail_after=fail_after):
+                r = run_injected(
+                    [self.exe, "tag", "--key-hex", "0001", "--file", "-"],
+                    fail_after)
+                self.assertStdinReadFailure(r, f"tag fail_after={fail_after}")
+                self.assertNotIn(prefix_tag.encode(), r.stdout)
+
+                # Correct tag for the WHOLE message: finalizing the prefix
+                # would surface as a mismatch (exit 3), which is wrong too.
+                r = run_injected(
+                    [self.exe, "verify", "--key-hex", "0001", "--file", "-",
+                     "--tag-hex", whole_tag],
+                    fail_after)
+                self.assertStdinReadFailure(
+                    r, f"verify whole-tag fail_after={fail_after}")
+
+                # A tag matching only the delivered prefix must not turn
+                # the read failure into a successful verification.
+                r = run_injected(
+                    [self.exe, "verify", "--key-hex", "0001", "--file", "-",
+                     "--tag-hex", prefix_tag],
+                    fail_after)
+                self.assertStdinReadFailure(
+                    r, f"verify prefix-tag fail_after={fail_after}")
+
+
 def main():
     if len(sys.argv) not in (2, 3, 4):
         print("usage: regression_test.py /path/to/messagetag "
@@ -1756,12 +2067,16 @@ def main():
     VerifyRegression.tmpdir = None
     VerifyRegression.shim_path = TagRegression.shim_path
     VerifyRegression.write_shim_path = TagRegression.write_shim_path
+    StdinRegression.exe = TagRegression.exe
+    StdinRegression.tmpdir = None
+    StdinRegression.shim_path = TagRegression.shim_path
     argv = [sys.argv[0], "-v"]
     # unittest's TextTestRunner gives non-zero exit when a test fails.
     loader = unittest.defaultTestLoader
     suite = unittest.TestSuite([
         loader.loadTestsFromTestCase(TagRegression),
         loader.loadTestsFromTestCase(VerifyRegression),
+        loader.loadTestsFromTestCase(StdinRegression),
     ])
     result = unittest.TextTestRunner(verbosity=2).run(suite)
     return 0 if result.wasSuccessful() else 1
