@@ -59,13 +59,17 @@ if(Python3_Interpreter_FOUND)
     # Test-only LD_PRELOAD shims (tests/*_fault_shim.cpp). The read shim
     # makes a chosen file fail with a read error after a chosen number of
     # bytes, so the regression suite can exercise "open succeeded, partial
-    # content read, then the read failed"; the write shim makes standard
-    # output fail after a chosen number of bytes, exercising "result line
-    # partly delivered, then the write failed", and its scripted mode
-    # replays recoverable interruptions (short writes, transient EINTRs,
-    # optionally followed by a permanent error) so the suite can pin
-    # "interrupted, resumed, and the complete result still arrived".
-    # They are never linked into messagetag.
+    # content read, then the read failed"; in its scripted mode it replays
+    # a per-read(2) sequence against standard input -- exact-size reads,
+    # transient EINTRs (which the program must retry), optionally followed
+    # by a permanent error -- so the suite can pin "interrupted, resumed,
+    # and the complete message is still authenticated". The write shim
+    # makes standard output fail after a chosen number of bytes, exercising
+    # "result line partly delivered, then the write failed", and its
+    # scripted mode replays recoverable interruptions (short writes,
+    # transient EINTRs, optionally followed by a permanent error) so the
+    # suite can pin "interrupted, resumed, and the complete result still
+    # arrived". They are never linked into messagetag.
     add_library(read_fault_shim MODULE tests/read_fault_shim.cpp)
     target_link_libraries(read_fault_shim PRIVATE ${CMAKE_DL_LIBS})
     add_library(write_fault_shim MODULE tests/write_fault_shim.cpp)

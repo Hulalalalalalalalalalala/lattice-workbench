@@ -72,6 +72,29 @@ non-empty prefix (injected via the read-fault shim with the message file
 as fd 0), are exit 1 with empty stdout and a standard-input read
 diagnostic -- the received prefix is never authenticated as the message.
 
+The standard-input suite additionally pins *recoverable read
+interruptions*. Pipe timing can never make read(2) return -1/EINTR, so
+mere delay or batched sending cannot exercise the retry path: the read
+shim's scripted mode (MESSAGETAG_READ_FAULT_SCRIPT) makes a read fail
+with EINTR for real -- before the first message byte and again after a
+non-empty prefix, once and as finite consecutive bursts -- and its trace
+proves the interruptions happened in call order. Recovery must leave
+the whole message authenticated: post-recovery bytes may arrive in
+installments, NUL bytes and what follows them survive, a 131109-byte
+message crosses the 64 KiB read boundary (including an interruption
+exactly when 64 KiB has been received), and no result is produced while
+the input is still open. The expected tag comes from Python's hmac and
+hard-coded constants (re-derived in test_00), never from the program's
+interrupted output, and an uninterrupted run of the same bytes gives
+the same result. verify accepts the whole-message tag (OK, exit 0) but
+a tag matching only the pre-interruption prefix is an ordinary mismatch
+(exit 3, empty stdout); an empty input interrupted before EOF is still
+the empty message. A permanent read error after recoverable steps
+keeps the failure contract: both commands exit 1 with empty stdout and
+a standard-input read diagnostic; verify neither accepts nor reports a
+mismatch even when the supplied tag matches the received prefix, and no
+diagnostic echoes the key, supplied tag or recomputed tag.
+
 Usage:
 
     python3 tests/regression_test.py /path/to/messagetag \
@@ -90,6 +113,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 # ---------------------------------------------------------------------------
@@ -114,6 +138,23 @@ def stream_bytes(n):
     from large_bytes). Used for messages whose length is an exact multiple
     of the 64 KiB read chunk, plus one-byte-off neighbours."""
     return bytes((i * 17 + 5) % 256 for i in range(n))
+
+
+# Message for the standard-input EINTR-recovery tests: two whole 64 KiB
+# read chunks plus a ragged 37-byte tail, with zero bytes both inside the
+# first chunk (offset 5) and *after* the 64 KiB boundary (offset 65540).
+# Interruptions are injected mid-stream by the read-fault shim's scripted
+# mode, and recovery must leave every one of these bytes -- the NULs and
+# everything after them -- authenticated in its original position.
+STDIN_INTERRUPT_LEN = 2 * READ_CHUNK + 37       # 131109 bytes
+
+
+def interrupted_stdin_bytes():
+    msg = bytearray((i * 13 + 11) % 256
+                    for i in range(STDIN_INTERRUPT_LEN))
+    msg[5] = 0
+    msg[65540] = 0
+    return bytes(msg)
 
 
 # ---------------------------------------------------------------------------
@@ -195,6 +236,31 @@ _mid_msg[70000] ^= 0xFF
 PROJECT_VECTORS.append(
     ("large_mid", LARGE_KEY_HEX, bytes(_mid_msg),
      "4b27ce3500f1809311e794fd10e2e4afc4278ebd11435835746a13f7fb41aa2f"))
+
+# stdin_interrupt: the EINTR-recovery fixture, independent tag computed
+# with Python's hmac/hashlib and re-derived at runtime by test_00, so the
+# recovery tests never take the program's own output as the answer.
+PROJECT_VECTORS.append(
+    ("stdin_interrupt", "0001", interrupted_stdin_bytes(),
+     "a494a9abaff72f68dc5524ac5c7371ebbeede944158863e2872bdfa9e3c4ea9e"))
+
+# stdin_interrupt_small: 27 bytes starting with a NUL (what follows the
+# NUL participates too), small enough to sit entirely in the pipe buffer
+# before the child is started -- used for "interrupted before the first
+# byte" and "interrupted a few bytes in" runs where input must stay open
+# after the interruption. Prefix tags pin verify's mismatch result after
+# recovery; they are re-derived from expected_hmac in
+# StdinRegression.test_108_prefix_tag_constants_match.
+STDIN_INTERRUPT_SMALL = b"\x00after-nul-bytes-0123456789"
+STDIN_INTERRUPT_SMALL_TAG = (
+    "92be5891dbe6341b6c11eb15947b9a2a2b8ab1c5772080006654831694c034bf")
+STDIN_INTERRUPT_SMALL_PREFIX_TAGS = {
+    7: "98a122e0f15f5cc3f4a0260c5339a443733284368aaf21c4f4b34bc7d022a124",
+    10: "9247d0c15a84bbc816278dc52966b5e496c0524677599aa8c9d3cc38a8636392",
+}
+PROJECT_VECTORS.append(
+    ("stdin_interrupt_small", "0001", STDIN_INTERRUPT_SMALL,
+     STDIN_INTERRUPT_SMALL_TAG))
 
 # Messages whose length is an exact multiple of the 64 KiB read chunk: the
 # final read returns 0 bytes at EOF, which is normal termination, not a
@@ -485,6 +551,94 @@ def assert_scripted_permanent_failure(case, argv, steps, tmpdir, full_line,
         trace, expected,
         f"{label}: the shim must have injected exactly the scripted "
         f"interruptions (steps={steps}); got trace {trace}")
+
+
+# ---------------------------------------------------------------------------
+# Scripted read faults on standard input: recoverable interruptions
+# (transient EINTRs and short reads), optionally followed by a permanent
+# read error. Pipe timing can never make read(2) return -1/EINTR, so the
+# read-fault shim's scripted mode is the only way to exercise the
+# program's "retry after EINTR, keep every byte already received" path
+# for real -- delay or batched sending alone cannot.
+# ---------------------------------------------------------------------------
+
+# Names the read-fault shim accepts as permanent steps.
+READ_SCRIPT_ERRNOS = {
+    "EIO": errno.EIO,
+    "EPIPE": errno.EPIPE,
+    "EBADF": errno.EBADF,
+}
+
+
+def read_script_env(shim, steps, trace_path, fd=0):
+    """Environment for a scripted read run: one step per read() on the
+    target fd -- an integer N caps that read at N bytes (a short read),
+    "EINTR" fails one read with EINTR (to be retried), and
+    "EIO"/"EPIPE"/"EBADF" latch a permanent error. Every intercepted read
+    is appended to ``trace_path`` (R<n>/E<n>/P<n>) so a test can prove the
+    interruptions were really injected."""
+    env = dict(os.environ)
+    env["LD_PRELOAD"] = shim
+    env["MESSAGETAG_READ_FAULT_FD"] = str(fd)
+    env["MESSAGETAG_READ_FAULT_SCRIPT"] = ",".join(str(s) for s in steps)
+    env["MESSAGETAG_READ_FAULT_TRACE"] = trace_path
+    if os.path.exists(trace_path):
+        os.unlink(trace_path)
+    return env
+
+
+def read_read_trace(trace_path):
+    """The shim's trace as a list of events: b"R<n>" (n bytes delivered by
+    a scripted short read), b"E<n>" (read failed with errno n),
+    b"P<n>" (n bytes passed through after the script ended; P0 is the
+    clean zero-byte read at end of input)."""
+    with open(trace_path, "rb") as f:
+        return f.read().split()
+
+
+def expected_read_script_events(steps):
+    """Replay the *scripted* portion of ``steps`` the way the shim logs it:
+    b"R<n>" for an integer short-read step, b"E<EINTR>" for a transient
+    interrupt, and b"E<errno>" for a permanent step (which ends the script
+    then and there -- the program reads no further). Returns
+    (events, latched). Pass-through events after the script is exhausted
+    are intentionally not predicted: their chunking follows pipe timing,
+    only their byte total is checked by the caller."""
+    events = []
+    for step in steps:
+        if isinstance(step, int):
+            events.append(b"R%d" % step)
+        elif step == "EINTR":
+            events.append(b"E%d" % errno.EINTR)
+        else:
+            events.append(b"E%d" % READ_SCRIPT_ERRNOS[step])
+            return events, True
+    return events, False
+
+
+def wait_read_trace(trace_path, count, deadline=10.0):
+    """Wait until the shim trace holds at least ``count`` events (or the
+    deadline passes), returning the events read so far."""
+    end = time.monotonic() + deadline
+    while time.monotonic() < end:
+        if os.path.exists(trace_path):
+            with open(trace_path, "rb") as f:
+                events = f.read().split()
+            if len(events) >= count:
+                return events
+        time.sleep(0.01)
+    raise AssertionError(
+        f"read-fault shim trace {trace_path} did not reach {count} events "
+        f"within {deadline}s; got "
+        f"{read_read_trace(trace_path) if os.path.exists(trace_path) else []}")
+
+
+def trace_event_bytes(event):
+    """The byte count a trace event accounts for: delivered bytes for R/P
+    events (P0 at EOF contributes zero), zero for an error event."""
+    if event[:1] in (b"R", b"P"):
+        return int(event[1:])
+    return 0
 
 
 def run_with_closed_stdout(argv):
@@ -2049,6 +2203,652 @@ class StdinRegression(unittest.TestCase):
                     fail_after)
                 self.assertStdinReadFailure(
                     r, f"verify prefix-tag fail_after={fail_after}")
+
+    # -- standard input interrupted (EINTR), then read resumes -------------
+    #
+    # read(2) returning -1/EINTR cannot be arranged by pipe timing: a slow
+    # or installment-wise upstream only ever produces short reads, never
+    # an interrupted one. The read-fault shim's scripted mode makes the
+    # interruption real (and its trace proves it), so these tests pin the
+    # program's existing behaviour: retry the read, keep every byte
+    # already received, authenticate the complete message after the
+    # normal end of input.
+
+    _trace_seq = 0
+
+    def _new_trace_path(self):
+        self._trace_seq += 1
+        return os.path.join(
+            self.tmpdir, f"read-script-trace-{self._trace_seq}.log")
+
+    def tag_stdin_argv(self, key_hex="0001"):
+        return [self.exe, "tag", "--key-hex", key_hex, "--file", "-"]
+
+    def verify_stdin_argv(self, tag_hex, key_hex="0001"):
+        return [self.exe, "verify", "--key-hex", key_hex, "--file", "-",
+                "--tag-hex", tag_hex]
+
+    def assertTagLine(self, rc, stdout, stderr, expected_tag, label):
+        self.assertEqual(
+            rc, 0, f"{label}: expected exit 0, got {rc}; stderr={stderr!r}")
+        self.assertEqual(stderr, b"",
+                         f"{label}: stderr must be empty, got {stderr!r}")
+        self.assertRegex(stdout, TAG_RE,
+                         f"{label}: stdout must be 64 lowercase hex chars + "
+                         f"newline, got {stdout!r}")
+        self.assertEqual(stdout, expected_tag.encode() + b"\n",
+                         f"{label}: wrong tag, got {stdout!r}")
+
+    def assertOkLine(self, rc, stdout, stderr, label):
+        self.assertEqual(
+            rc, 0, f"{label}: expected exit 0, got {rc}; stderr={stderr!r}")
+        self.assertEqual(stdout, b"OK\n",
+                         f"{label}: stdout must be exactly b'OK\\n', got "
+                         f"{stdout!r}")
+        self.assertEqual(stderr, b"",
+                         f"{label}: stderr must be empty, got {stderr!r}")
+
+    def assertStillReading(self, proc, label):
+        """While standard input is still open: no conclusion, no result or
+        prompt on stdout, and the process keeps reading."""
+        self.assertIsNone(
+            proc.poll(),
+            f"{label}: no conclusion may be reached before the input ends")
+        readable, _, _ = select.select([proc.stdout], [], [], 0.5)
+        self.assertEqual(
+            readable, [],
+            f"{label}: nothing may be written while the input is open")
+
+    def assertScriptedInterruptsReal(self, trace, script_events, label,
+                                     before_first_byte=False,
+                                     after_prefix=False):
+        """The trace must account for every scripted step in order (so
+        the shim really injected each interruption rather than being
+        inert), and at least one step must be a genuine EINTR. The
+        positional flags pin *when* an interruption happened: before
+        any byte was delivered, and/or after a non-empty prefix.
+
+        Scripted short-read steps deliver their exact byte count: the
+        shim accumulates each step across as many underlying reads as
+        pipe size and send timing require (an ordinary blocking read
+        from the program's point of view), so R-events are deterministic
+        on any pipe. EINTR/error events are always exact. Byte-in/
+        byte-out completeness is checked separately by
+        assertRecoveredBytesComplete, and the HMAC result catches any
+        loss, duplication or reordering."""
+        head = trace[:len(script_events)]
+        self.assertEqual(
+            len(head), len(script_events),
+            f"{label}: the shim must have injected all scripted steps; "
+            f"got {trace}")
+        eintr = b"E%d" % errno.EINTR
+        for actual, expected in zip(head, script_events):
+            if expected[:1] == b"R":
+                self.assertEqual(
+                    actual[:1], b"R",
+                    f"{label}: expected a scripted short read, got "
+                    f"{actual}; trace {trace}")
+                self.assertEqual(
+                    int(actual[1:]), int(expected[1:]),
+                    f"{label}: scripted read must deliver exactly its cap "
+                    f"{expected[1:]}, got {actual}; trace {trace}")
+            else:
+                self.assertEqual(
+                    actual, expected,
+                    f"{label}: scripted fault event mismatch; trace {trace}")
+        self.assertIn(
+            eintr, script_events,
+            f"{label}: test bug: script {script_events!r} contains no EINTR")
+        if before_first_byte:
+            self.assertEqual(
+                head[0], eintr,
+                f"{label}: the first read itself must be interrupted "
+                f"before a single byte arrived; got {head}")
+        if after_prefix:
+            # Some genuine EINTR must occur once a non-empty prefix has
+            # already been delivered (not necessarily the first EINTR --
+            # scripts may interrupt before the first byte and again
+            # later).
+            seen = 0
+            interrupted_after_prefix = False
+            for event in head:
+                if event[:1] == b"R":
+                    seen += int(event[1:])
+                elif event == eintr and seen > 0:
+                    interrupted_after_prefix = True
+            self.assertTrue(
+                interrupted_after_prefix,
+                f"{label}: an interruption must also occur after a "
+                f"non-empty prefix was delivered; got {head}")
+
+    def assertRecoveredBytesComplete(self, trace, script_events, length,
+                                     label):
+        """After the scripted prefix, only ordinary pass-through reads
+        follow, and the delivered byte total is exactly the whole
+        message: no byte lost, duplicated or reordered (the position-
+        dependent messages then fail HMAC on any such corruption),
+        ending with the clean zero-byte read at EOF."""
+        tail = trace[len(script_events):]
+        self.assertTrue(
+            tail, f"{label}: after the script the final reads must pass "
+                  f"through (ending in EOF); got {trace}")
+        self.assertTrue(
+            all(e[:1] == b"P" for e in tail),
+            f"{label}: no further fault may be injected after recovery; "
+            f"got {trace}")
+        self.assertEqual(
+            tail[-1], b"P0",
+            f"{label}: the stream must end with the normal zero-byte EOF "
+            f"read, not a failure; got {trace}")
+        total = sum(trace_event_bytes(e) for e in trace)
+        self.assertEqual(
+            total, length,
+            f"{label}: exactly the whole message must have been delivered "
+            f"once, got {total} of {length} bytes; trace {trace}")
+
+    def run_buffered_interrupt(self, argv, steps, data, label):
+        """Small-message flow: put all of ``data`` (which must fit the
+        pipe buffer) into the pipe *before* starting the child, but keep
+        the write end open. Start the child under ``steps``, wait until
+        the whole script has been consumed, prove the child is still
+        reading with an empty stdout, then end the input and collect the
+        run. Returns (rc, stdout, stderr, trace)."""
+        trace_path = self._new_trace_path()
+        r, w = os.pipe()
+        proc = None
+        r_open = True
+        w_open = True
+        try:
+            if data:
+                os.write(w, data)
+            env = read_script_env(self.shim, steps, trace_path)
+            proc = subprocess.Popen(
+                argv, stdin=r, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, env=env)
+            # The child holds its own dup of the read end; release ours.
+            os.close(r)
+            r_open = False
+            script_events, latched = expected_read_script_events(steps)
+            self.assertFalse(latched, f"{label}: test bug: script latches")
+            wait_read_trace(trace_path, len(script_events))
+            # Input is still open here: the interruptions must neither end
+            # the message early nor produce any output.
+            self.assertStillReading(proc, label)
+            os.close(w)
+            w_open = False
+            stdout, stderr = proc.communicate(timeout=30)
+            return proc.returncode, stdout, stderr, read_read_trace(trace_path)
+        finally:
+            if r_open:
+                os.close(r)
+            if proc is not None and proc.poll() is None:
+                proc.kill()
+                proc.communicate()
+            if w_open:
+                os.close(w)
+
+    def run_large_interrupted(self, argv, steps, data, batches, label):
+        """Large-message flow with the input fed in installments: start
+        the child under ``steps`` and write the first installment (sized
+        to cover every byte the scripted short reads may consume), then
+        wait until the ENTIRE script has been consumed, proving each
+        interruption really happened. Remaining ``batches`` follow one
+        at a time; the process must stay silent and undecided while the
+        input is open between batches. The input is ended only after
+        the last batch. Returns (rc, stdout, stderr, trace)."""
+        trace_path = self._new_trace_path()
+        env = read_script_env(self.shim, steps, trace_path)
+        proc = subprocess.Popen(
+            argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, env=env)
+        try:
+            script_events, latched = expected_read_script_events(steps)
+            self.assertFalse(latched, f"{label}: test bug: script latches")
+            first, *rest = batches
+            if first is None:
+                first = len(data)
+            offset = first
+            proc.stdin.write(data[:first])
+            proc.stdin.flush()
+            # Every scripted read now has bytes available (the first
+            # installment covers all scripted short-read caps), so the
+            # full script is consumed deterministically.
+            wait_read_trace(trace_path, len(script_events))
+            for i, size in enumerate(rest):
+                # Input deliberately left open mid-message between
+                # installments: no conclusion and no output yet.
+                self.assertStillReading(proc, f"{label} batch {i}")
+                if size is None:
+                    piece = data[offset:]
+                else:
+                    piece = data[offset:offset + size]
+                offset += len(piece)
+                proc.stdin.write(piece)
+                proc.stdin.flush()
+            self.assertEqual(offset, len(data),
+                             f"{label}: test bug: batches must cover the "
+                             f"whole message ({offset} != {len(data)})")
+            # Everything delivered, but the input has not ended yet.
+            self.assertStillReading(proc, label)
+            proc.stdin.close()
+            proc.stdin = None  # communicate() must not touch it again
+            stdout, stderr = proc.communicate(timeout=30)
+            return proc.returncode, stdout, stderr, read_read_trace(trace_path)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.communicate()
+
+    def run_recovery_failure(self, argv, steps, data, label):
+        """Recoverable script steps followed by a latched permanent read
+        error. ``subprocess`` feeds ``data`` concurrently with the
+        child's reads; the shim's accumulating R-steps deliver their
+        exact caps as bytes arrive, then the permanent error ends the
+        run. Returns (result, trace); the program must read no further
+        once the error latches."""
+        trace_path = self._new_trace_path()
+        env = read_script_env(self.shim, steps, trace_path)
+        result = subprocess.run(
+            argv, input=data, capture_output=True, env=env)
+        return result, read_read_trace(trace_path)
+
+    def test_108_interrupt_fixture_constants_match_stdlib(self):
+        """Anti-typo guard for the EINTR-recovery constants: the
+        hard-coded small-fixture and small-fixture prefix tags are
+        re-derived from Python's hmac (an implementation unrelated to
+        the program), and the large fixture is the stdin_interrupt
+        vector already checked in test_00. The recovery tests below are
+        therefore not anchored to the program's own output."""
+        self.assertEqual(
+            expected_hmac("0001", STDIN_INTERRUPT_SMALL),
+            STDIN_INTERRUPT_SMALL_TAG)
+        for length, tag in STDIN_INTERRUPT_SMALL_PREFIX_TAGS.items():
+            self.assertEqual(
+                expected_hmac("0001", STDIN_INTERRUPT_SMALL[:length]),
+                tag, f"small prefix {length}")
+
+    def test_109_tag_eintr_before_first_byte_then_resumes(self):
+        """The very first read(2) of standard input returns EINTR -- once,
+        and as a finite burst -- before a single message byte has
+        arrived. The program retries; once the (still open) input later
+        ends, tag exits 0 with the independently computed tag of the
+        whole message and empty stderr. The trace proves the
+        interruption genuinely happened before any byte, which no amount
+        of send delay could simulate."""
+        if self.shim is None:
+            self.skipTest("read-fault shim not available (build with CMake "
+                          "or pass its path as the second argument)")
+        if not os.path.exists("/proc/self/fd"):
+            self.skipTest("read-fault shim needs /proc/self/fd (Linux)")
+        data = STDIN_INTERRUPT_SMALL
+        for steps in (["EINTR"],
+                      ["EINTR", "EINTR", "EINTR"],
+                      ["EINTR", 14, "EINTR"]):
+            with self.subTest(steps=steps):
+                script_events, _ = expected_read_script_events(steps)
+                rc, out, err, trace = self.run_buffered_interrupt(
+                    self.tag_stdin_argv(), steps, data,
+                    f"tag steps={steps}")
+                self.assertTagLine(
+                    rc, out, err, STDIN_INTERRUPT_SMALL_TAG,
+                    f"tag steps={steps}")
+                self.assertScriptedInterruptsReal(
+                    trace, script_events, f"tag steps={steps}",
+                    before_first_byte=True)
+                self.assertRecoveredBytesComplete(
+                    trace, script_events, len(data), f"tag steps={steps}")
+
+    def test_110_tag_eintr_after_nonempty_prefix_then_resumes(self):
+        """A non-empty prefix is already received and then read(2) is
+        interrupted -- once or as a burst. The received bytes are
+        neither lost nor re-read: after recovery and the normal end of
+        input the tag is the whole message's tag, stderr is empty."""
+        if self.shim is None:
+            self.skipTest("read-fault shim not available")
+        if not os.path.exists("/proc/self/fd"):
+            self.skipTest("read-fault shim needs /proc/self/fd (Linux)")
+        data = STDIN_INTERRUPT_SMALL
+        scripts = [
+            [7, "EINTR"],
+            [10, "EINTR", "EINTR"],
+            [7, "EINTR", "EINTR", 3, "EINTR"],
+        ]
+        for steps in scripts:
+            with self.subTest(steps=steps):
+                script_events, _ = expected_read_script_events(steps)
+                rc, out, err, trace = self.run_buffered_interrupt(
+                    self.tag_stdin_argv(), steps, data,
+                    f"tag steps={steps}")
+                self.assertTagLine(
+                    rc, out, err, STDIN_INTERRUPT_SMALL_TAG,
+                    f"tag steps={steps}")
+                self.assertScriptedInterruptsReal(
+                    trace, script_events, f"tag steps={steps}",
+                    after_prefix=True)
+                self.assertRecoveredBytesComplete(
+                    trace, script_events, len(data), f"tag steps={steps}")
+
+    def test_111_tag_large_message_interrupted_across_chunk_boundary(self):
+        """A message longer than two 64 KiB read chunks, carrying NUL
+        bytes and following bytes both below and above the 64 KiB
+        boundary: an interruption before the first byte, an interruption
+        after a non-empty prefix, finite bursts of consecutive
+        interruptions, and an interruption exactly at the 64 KiB
+        boundary must all leave the complete message authenticated.
+        Post-recovery bytes arrive in separate installments; while the
+        input is open the process stays silent and keeps reading. The
+        result is compared to (a) Python's hmac over the bytes and (b)
+        an uninterrupted run over the very same bytes -- never to the
+        program's interrupted output alone."""
+        if self.shim is None:
+            self.skipTest("read-fault shim not available")
+        if not os.path.exists("/proc/self/fd"):
+            self.skipTest("read-fault shim needs /proc/self/fd (Linux)")
+        data = interrupted_stdin_bytes()
+        expected_tag = expected_hmac("0001", data)
+        # Independent basis (b): the same bytes read without any shim.
+        plain = subprocess.run(
+            self.tag_stdin_argv(), input=data, capture_output=True)
+        self.assertTagLine(plain.returncode, plain.stdout, plain.stderr,
+                           expected_tag, "uninterrupted control run")
+
+        scenarios = [
+            # Interruptions before the first byte and again after a
+            # prefix, fed in installments that do not line up with the
+            # read buffer.
+            ("installments",
+             ["EINTR", 100, "EINTR", "EINTR"],
+             [70000, 30000, None],
+             dict(before_first_byte=True, after_prefix=True)),
+            # An interruption placed exactly at the 64 KiB read
+            # boundary (1 + 65535 bytes delivered, then EINTR), plus a
+            # burst of consecutive interruptions.
+            ("boundary",
+             [1, "EINTR", "EINTR", 65535, "EINTR", "EINTR", "EINTR"],
+             [70000, 27536, None],
+             dict(after_prefix=True)),
+        ]
+        for kind, steps, batches, flags in scenarios:
+            with self.subTest(kind=kind, steps=steps):
+                script_events, _ = expected_read_script_events(steps)
+                rc, out, err, trace = self.run_large_interrupted(
+                    self.tag_stdin_argv(), steps, data, batches,
+                    f"tag {kind} steps={steps}")
+                self.assertTagLine(rc, out, err, expected_tag,
+                                   f"tag steps={steps}")
+                self.assertEqual(
+                    out, plain.stdout,
+                    f"steps={steps}: interrupted and uninterrupted reads "
+                    f"of the same bytes must give the same tag")
+                # The shim accumulates each short-read step to its exact
+                # cap regardless of pipe size/send timing, so the
+                # scripted R-events are exact and the EINTRs are real.
+                self.assertScriptedInterruptsReal(
+                    trace, script_events, f"tag steps={steps}", **flags)
+                self.assertRecoveredBytesComplete(
+                    trace, script_events, len(data), f"tag steps={steps}")
+                if kind == "boundary":
+                    # An EINTR must be observed with exactly one 64 KiB
+                    # read chunk already delivered.
+                    seen = 0
+                    hit_boundary = False
+                    for event in trace[:len(script_events)]:
+                        if event == b"E%d" % errno.EINTR and \
+                                seen == READ_CHUNK:
+                            hit_boundary = True
+                        if event[:1] == b"R":
+                            seen += int(event[1:])
+                    self.assertTrue(
+                        hit_boundary,
+                        f"steps={steps}: an interruption must occur with "
+                        f"exactly 64 KiB received; trace {trace}")
+
+    def test_112_verify_ok_after_read_interruptions(self):
+        """verify retries through EINTR exactly as tag does: with the
+        correct whole-message tag supplied, interruptions before the
+        first byte, after a non-empty prefix, in bursts and across the
+        64 KiB boundary all still end in exit 0 with exactly 'OK\\n' and
+        empty stderr -- no mismatch is reported for bytes that were
+        merely delayed by the interruption."""
+        if self.shim is None:
+            self.skipTest("read-fault shim not available")
+        if not os.path.exists("/proc/self/fd"):
+            self.skipTest("read-fault shim needs /proc/self/fd (Linux)")
+
+        small = STDIN_INTERRUPT_SMALL
+        small_tag = STDIN_INTERRUPT_SMALL_TAG
+        # (steps, whether the first read is interrupted before any byte,
+        # whether an interruption also follows a non-empty prefix).
+        scripts = [
+            (["EINTR"], True, False),
+            (["EINTR", "EINTR", "EINTR"], True, False),
+            (["EINTR", 14, "EINTR"], True, True),
+            ([7, "EINTR"], False, True),
+            ([10, "EINTR", "EINTR"], False, True),
+            ([7, "EINTR", "EINTR", 3, "EINTR"], False, True),
+        ]
+        for steps, before_first, after_prefix in scripts:
+            with self.subTest(size="small", steps=steps):
+                script_events, _ = expected_read_script_events(steps)
+                rc, out, err, trace = self.run_buffered_interrupt(
+                    self.verify_stdin_argv(small_tag), steps, small,
+                    f"verify steps={steps}")
+                self.assertOkLine(rc, out, err, f"verify steps={steps}")
+                self.assertScriptedInterruptsReal(
+                    trace, script_events, f"verify steps={steps}",
+                    before_first_byte=before_first,
+                    after_prefix=after_prefix)
+                self.assertRecoveredBytesComplete(
+                    trace, script_events, len(small), f"verify steps={steps}")
+
+        big = interrupted_stdin_bytes()
+        big_tag = expected_hmac("0001", big)
+        steps = ["EINTR", 100, "EINTR", "EINTR"]
+        script_events, _ = expected_read_script_events(steps)
+        rc, out, err, trace = self.run_large_interrupted(
+            self.verify_stdin_argv(big_tag), steps, big,
+            [70000, 30000, None], f"verify steps={steps}")
+        self.assertOkLine(rc, out, err, f"verify steps={steps}")
+        self.assertScriptedInterruptsReal(
+            trace, script_events, f"verify steps={steps}",
+            before_first_byte=True, after_prefix=True)
+        self.assertRecoveredBytesComplete(
+            trace, script_events, len(big), f"verify steps={steps}")
+
+    def test_113_verify_prefix_tag_is_mismatch_after_recovery(self):
+        """After recovery the WHOLE message is what gets compared: a tag
+        that authenticates only the prefix received before the
+        interruption must not verify. The result is the ordinary
+        mismatch contract -- exit 3, empty stdout, mismatch diagnostic
+        that names no cause and leaks neither the supplied tag, the key
+        nor a recomputed tag."""
+        if self.shim is None:
+            self.skipTest("read-fault shim not available")
+        if not os.path.exists("/proc/self/fd"):
+            self.skipTest("read-fault shim needs /proc/self/fd (Linux)")
+
+        # Small fixture: prefix tags are independent hard-coded constants.
+        cases = [
+            (["EINTR", 7, "EINTR"], 7),
+            ([10, "EINTR", "EINTR"], 10),
+            ([7, "EINTR", "EINTR", 3, "EINTR"], 10),
+        ]
+        for steps, prefix_len in cases:
+            prefix_tag = STDIN_INTERRUPT_SMALL_PREFIX_TAGS[prefix_len]
+            with self.subTest(steps=steps, prefix=prefix_len):
+                script_events, _ = expected_read_script_events(steps)
+                rc, out, err, trace = self.run_buffered_interrupt(
+                    self.verify_stdin_argv(prefix_tag), steps,
+                    STDIN_INTERRUPT_SMALL, f"verify prefix steps={steps}")
+                self.assertEqual(
+                    rc, 3, f"steps={steps}: expected mismatch exit 3, got "
+                    f"{rc}; stdout={out!r} stderr={err!r}")
+                self.assertEqual(
+                    out, b"",
+                    f"steps={steps}: stdout must be empty on mismatch")
+                self.assertIn(b"mismatch", err.lower())
+                self.assertNotRegex(err, rb"(?i)[0-9a-f]{64}")
+                self.assertNotIn(prefix_tag.encode(), err)
+                self.assertScriptedInterruptsReal(
+                    trace, script_events, f"verify steps={steps}",
+                    before_first_byte=(steps[0] == "EINTR"),
+                    after_prefix=True)
+                self.assertRecoveredBytesComplete(
+                    trace, script_events, len(STDIN_INTERRUPT_SMALL),
+                    f"verify steps={steps}")
+
+        # Large fixture, interruption exactly at the 64 KiB boundary: a
+        # tag of the first 64 KiB must mismatch the complete message once
+        # the remaining 65573 bytes arrive after recovery.
+        big = interrupted_stdin_bytes()
+        boundary_tag = expected_hmac("0001", big[:READ_CHUNK])
+        steps = [1, "EINTR", "EINTR", 65535, "EINTR"]
+        script_events, _ = expected_read_script_events(steps)
+        rc, out, err, trace = self.run_large_interrupted(
+            self.verify_stdin_argv(boundary_tag), steps, big,
+            [70000, 27536, None], "verify 64KiB-prefix tag")
+        self.assertEqual(rc, 3, f"stderr={err!r}")
+        self.assertEqual(out, b"")
+        self.assertIn(b"mismatch", err.lower())
+        self.assertNotRegex(err, rb"(?i)[0-9a-f]{64}")
+        self.assertScriptedInterruptsReal(
+            trace, script_events, "verify 64KiB-prefix tag",
+            after_prefix=True)
+        self.assertRecoveredBytesComplete(
+            trace, script_events, len(big), "verify 64KiB-prefix tag")
+        # The interruption really occurred with exactly 64 KiB received.
+        seen = 0
+        hit = False
+        for event in trace[:len(script_events)]:
+            if event == b"E%d" % errno.EINTR and seen == READ_CHUNK:
+                hit = True
+            if event[:1] == b"R":
+                seen += int(event[1:])
+        self.assertTrue(
+            hit, f"interruption must land with exactly 64 KiB received; "
+                 f"trace {trace}")
+
+    def test_114_empty_message_interrupted_before_eof(self):
+        """An empty input whose read is interrupted -- once or as a
+        burst -- is still the empty message once the input ends
+        normally: tag prints the standard empty-message tag, and verify
+        accepts the empty-message tag (and mismatches a non-empty
+        message's tag)."""
+        if self.shim is None:
+            self.skipTest("read-fault shim not available")
+        if not os.path.exists("/proc/self/fd"):
+            self.skipTest("read-fault shim needs /proc/self/fd (Linux)")
+        empty_tag = "999a901219f032cd497cadb5e6051e97b6a29ab297bd6ae722bd6062a2f59542"
+        for steps in (["EINTR"], ["EINTR", "EINTR", "EINTR"]):
+            with self.subTest(steps=steps):
+                script_events, _ = expected_read_script_events(steps)
+                rc, out, err, trace = self.run_buffered_interrupt(
+                    self.tag_stdin_argv("0b" * 20), steps, b"",
+                    f"tag empty steps={steps}")
+                self.assertTagLine(rc, out, err, empty_tag,
+                                   f"tag empty steps={steps}")
+                self.assertScriptedInterruptsReal(
+                    trace, script_events, f"tag empty steps={steps}",
+                    before_first_byte=True)
+                # Only the clean EOF read follows the script.
+                self.assertEqual(trace[len(script_events):], [b"P0"],
+                                 f"interrupted empty input must end with a "
+                                 f"clean EOF read; got {trace}")
+
+                rc, out, err, trace = self.run_buffered_interrupt(
+                    self.verify_stdin_argv(empty_tag, key_hex="0b" * 20),
+                    steps, b"", f"verify empty steps={steps}")
+                self.assertOkLine(rc, out, err,
+                                  f"verify empty steps={steps}")
+                self.assertScriptedInterruptsReal(
+                    trace, script_events, f"verify empty steps={steps}",
+                    before_first_byte=True)
+                self.assertEqual(trace[len(script_events):], [b"P0"])
+
+        # A non-empty message's tag against the interrupted empty input is
+        # a plain mismatch (exit 3), not a read failure.
+        hello_tag = self.HELLO_LF_TAG
+        rc, out, err, _ = self.run_buffered_interrupt(
+            self.verify_stdin_argv(hello_tag, key_hex="0b" * 20),
+            ["EINTR"], b"", "verify empty vs hello tag")
+        self.assertEqual(rc, 3)
+        self.assertEqual(out, b"")
+        self.assertIn(b"mismatch", err.lower())
+
+    def test_115_permanent_read_error_after_recovery_is_exit_1(self):
+        """A transient EINTR that recovers, followed by a *permanent*
+        read error, keeps the read-failure contract for both commands:
+        exit 1, empty stdout, one stderr line naming the standard-input
+        read failure. verify must neither accept (exit 0) nor merely
+        mismatch (exit 3) -- even when the supplied tag authenticates
+        exactly the prefix received before the error -- and the
+        diagnostics echo neither the key, the supplied tag nor a
+        recomputed tag."""
+        if self.shim is None:
+            self.skipTest("read-fault shim not available")
+        if not os.path.exists("/proc/self/fd"):
+            self.skipTest("read-fault shim needs /proc/self/fd (Linux)")
+
+        small = STDIN_INTERRUPT_SMALL
+        small_tag = STDIN_INTERRUPT_SMALL_TAG
+        big = interrupted_stdin_bytes()
+        big_tag = expected_hmac("0001", big)
+
+        scenarios = [
+            # (steps, data, whole tag, tag of the delivered prefix)
+            (["EINTR", "EIO"], small, small_tag, None),
+            ([7, "EINTR", "EIO"], small, small_tag,
+             STDIN_INTERRUPT_SMALL_PREFIX_TAGS[7]),
+            (["EINTR", "EINTR", 10, "EINTR", "EPIPE"], small, small_tag,
+             STDIN_INTERRUPT_SMALL_PREFIX_TAGS[10]),
+            ([100, "EINTR", "EIO"], big, big_tag,
+             expected_hmac("0001", big[:100])),
+            ([READ_CHUNK, "EINTR", "EIO"], big, big_tag,
+             expected_hmac("0001", big[:READ_CHUNK])),
+        ]
+        for steps, data, whole_tag, prefix_tag in scenarios:
+            with self.subTest(steps=steps, size=len(data)):
+                script_events, latched = expected_read_script_events(steps)
+                self.assertTrue(latched, "test bug: script must latch")
+                prefix_len = sum(
+                    int(s) for s in steps if isinstance(s, int))
+
+                r, trace = self.run_recovery_failure(
+                    self.tag_stdin_argv(), steps, data,
+                    f"tag steps={steps}")
+                self.assertStdinReadFailure(r, f"tag steps={steps}")
+                # The trace ends on the permanent error: the program
+                # never reads again, so no pass-through/EOF event follows.
+                self.assertEqual(
+                    trace, script_events,
+                    f"tag steps={steps}: interruption(s) then the "
+                    f"permanent error must be the final read activity; "
+                    f"got {trace}")
+                self.assertEqual(
+                    sum(trace_event_bytes(e) for e in trace), prefix_len,
+                    f"tag steps={steps}: only the scripted prefix may be "
+                    f"delivered; trace {trace}")
+
+                # Whole-message tag: finalizing the received prefix would
+                # report a mismatch (3) -- wrong; the error must win.
+                r, trace = self.run_recovery_failure(
+                    self.verify_stdin_argv(whole_tag), steps, data,
+                    f"verify whole-tag steps={steps}")
+                self.assertStdinReadFailure(
+                    r, f"verify whole-tag steps={steps}")
+                self.assertNotIn(whole_tag.encode(), r.stderr)
+                self.assertEqual(trace, script_events)
+
+                # A tag matching only the received prefix must not turn
+                # the failure into a successful verification either.
+                if prefix_tag is not None:
+                    r, trace = self.run_recovery_failure(
+                        self.verify_stdin_argv(prefix_tag), steps, data,
+                        f"verify prefix-tag steps={steps}")
+                    self.assertStdinReadFailure(
+                        r, f"verify prefix-tag steps={steps}")
+                    self.assertNotIn(prefix_tag.encode(), r.stderr)
+                    self.assertEqual(trace, script_events)
 
 
 def main():
