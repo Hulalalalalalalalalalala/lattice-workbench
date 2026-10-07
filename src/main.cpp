@@ -226,21 +226,16 @@ bool parseKey(const CommandSpec& spec, const std::string& keyHex,
     return false;
 }
 
-// Stream a message into HMAC-SHA-256 a fixed-size chunk at a time. The
-// message is never stored whole: regardless of its length, only one 64 KiB
-// read buffer is needed on top of the constant-size HMAC context.
-//
-// The bytes are not interpreted as text: trailing newlines are kept, line
-// endings are not converted and zero bytes are preserved. An empty input
-// simply yields no Update calls, which authenticates the empty message.
+// The outcome of authenticating one message: the tag was produced, the
+// message source failed, or the HMAC computation itself failed.
 enum class HmacStatus { kSuccess, kReadError, kCryptoError };
 
 // A streaming HMAC-SHA-256 computation: Init with the key at construction,
 // feed message bytes chunk by chunk with update(), produce the tag once
-// with finish(). The file and standard-input sources both feed their bytes
-// through this one path, so the same key and the same bytes always yield
-// the same tag no matter which source they came from, and no matter how
-// the input was split into reads.
+// with finish(). All message sources feed their bytes through this one
+// path, so the same key and the same bytes always yield the same tag no
+// matter which source they came from, and no matter how the input was
+// split into reads.
 //
 // HMAC_Init_ex performs the standard RFC 2104 key normalization itself, so
 // keys longer than the SHA-256 block size are hashed exactly as the
@@ -280,64 +275,94 @@ class HmacSha256Stream {
     bool usable_ = false;
 };
 
-HmacStatus hmacSha256File(const std::vector<unsigned char>& key,
-                          const std::string& path,
-                          std::array<unsigned char, EVP_MAX_MD_SIZE>& mac,
-                          std::size_t& macLength) {
-    HmacSha256Stream hmac(key);
-    if (!hmac.usable()) {
-        return HmacStatus::kCryptoError;
+// A message source delivers the message one chunk at a time through
+// readChunk(): fill `buffer` with up to `capacity` bytes and return how
+// many were delivered, return 0 once the message has ended normally, or
+// return -1 when the source fails (after which no further bytes are
+// requested). How a chunk is obtained -- and what counts as a failure --
+// is each source's own business; the shared authentication below only
+// ever sees the resulting byte stream.
+
+// A file source delivers the file's raw bytes exactly as stored: they
+// are not interpreted as text, trailing newlines are kept, line endings
+// are not converted and zero bytes are preserved. An empty file ends
+// immediately, which authenticates the empty message. Failing to open
+// the file is a read failure reported on the first chunk.
+class FileMessageSource {
+  public:
+    explicit FileMessageSource(const std::string& path)
+        : in_(path, std::ios::binary | std::ios::in), failed_(!in_) {}
+
+    ssize_t readChunk(char* buffer, std::size_t capacity) {
+        if (failed_) {
+            return -1;
+        }
+        if (ended_) {
+            return 0;
+        }
+        in_.read(buffer, static_cast<std::streamsize>(capacity));
+        // badbit means the read itself failed -- possibly after a
+        // non-empty prefix was already delivered. A short read at EOF
+        // is normal, and those remaining bytes still participate; the
+        // zero-byte read past the end is the normal end of the message.
+        if (in_.bad()) {
+            failed_ = true;
+            return -1;
+        }
+        if (in_.eof()) {
+            ended_ = true;
+        }
+        return static_cast<ssize_t>(in_.gcount());
     }
 
-    std::ifstream in(path, std::ios::binary | std::ios::in);
-    if (!in) {
-        return HmacStatus::kReadError;
-    }
+  private:
+    std::ifstream in_;
+    bool failed_ = false;
+    bool ended_ = false;
+};
 
-    std::array<char, 65536> buffer{};
-    while (in.read(buffer.data(), static_cast<std::streamsize>(buffer.size()))) {
-        if (!hmac.update(buffer.data(),
-                         static_cast<std::size_t>(in.gcount()))) {
-            return HmacStatus::kCryptoError;
+// A standard-input source (selected by "--file -") delivers every byte
+// that arrives on file descriptor 0 until the input ends normally (EOF).
+// Bytes arriving in several installments are simply several chunks,
+// which does not change the message. A read interrupted by EINTR before
+// any byte arrived is retried in place: the bytes received so far still
+// belong to the same message. Any other read failure ends the source
+// with an error.
+class StdinMessageSource {
+  public:
+    ssize_t readChunk(char* buffer, std::size_t capacity) {
+        for (;;) {
+            ssize_t n = ::read(STDIN_FILENO, buffer, capacity);
+            if (n >= 0) {
+                return n;  // n == 0 is the clean end of input
+            }
+            if (errno != EINTR) {
+                return -1;
+            }
         }
     }
-    // A read error (including one that happens after part of the message has
-    // already been fed to HMAC) aborts authentication: finish() is never
-    // called, so no partial-message tag can be produced. EOF with a short
-    // final read is normal and those remaining bytes must still participate.
-    if (in.bad()) {
-        return HmacStatus::kReadError;
-    }
-    if (in.gcount() > 0) {
-        if (!hmac.update(buffer.data(),
-                         static_cast<std::size_t>(in.gcount()))) {
-            return HmacStatus::kCryptoError;
-        }
-    }
+};
 
-    if (!hmac.finish(mac, macLength)) {
-        return HmacStatus::kCryptoError;
-    }
-    return HmacStatus::kSuccess;
-}
-
-// Stream standard input (file descriptor 0) into HMAC-SHA-256 until the
-// input ends normally (EOF). Selected by "--file -": every byte delivered
-// before the end of input is part of the message, exactly as with a file --
-// zero bytes and what follows them, trailing newlines and every line-ending
-// form are authenticated unchanged, nothing is trimmed or converted, no
-// line ending terminates the message early, and an empty input is the
-// empty message. Bytes arriving in several installments are simply several
-// update() calls, which does not change the tag. Only one fixed-size
-// buffer is used no matter how long the input runs, and nothing is
-// written to standard output while the input is still open.
+// The single place that maintains how a message is authenticated: start
+// HMAC-SHA-256 with the key, feed every chunk the source delivers in the
+// order it arrives, and finish exactly once, when the source reports the
+// message has ended normally. Both sources feed their bytes through this
+// one path, so the same key and the same bytes always yield the same tag
+// no matter which source they came from, no matter how the input was
+// split into reads, and no matter whether the last read filled the
+// buffer.
 //
-// A read error -- including one after a non-empty prefix has already been
-// fed to HMAC -- aborts authentication: finish() is never called, so the
-// received prefix can never be finalized as if it were the whole message.
-HmacStatus hmacSha256Stdin(const std::vector<unsigned char>& key,
-                           std::array<unsigned char, EVP_MAX_MD_SIZE>& mac,
-                           std::size_t& macLength) {
+// The message is never stored whole: regardless of its length, only one
+// 64 KiB read buffer is needed on top of the constant-size HMAC context.
+// A read failure -- including one after a non-empty prefix has already
+// been fed to HMAC -- aborts authentication: finish() is never reached,
+// so the received prefix can never be finalized as if it were the whole
+// message.
+template <typename Source>
+HmacStatus authenticateMessage(const std::vector<unsigned char>& key,
+                               Source& source,
+                               std::array<unsigned char, EVP_MAX_MD_SIZE>& mac,
+                               std::size_t& macLength) {
     HmacSha256Stream hmac(key);
     if (!hmac.usable()) {
         return HmacStatus::kCryptoError;
@@ -345,7 +370,7 @@ HmacStatus hmacSha256Stdin(const std::vector<unsigned char>& key,
 
     std::array<char, 65536> buffer{};
     for (;;) {
-        ssize_t n = ::read(STDIN_FILENO, buffer.data(), buffer.size());
+        ssize_t n = source.readChunk(buffer.data(), buffer.size());
         if (n > 0) {
             if (!hmac.update(buffer.data(), static_cast<std::size_t>(n))) {
                 return HmacStatus::kCryptoError;
@@ -353,10 +378,7 @@ HmacStatus hmacSha256Stdin(const std::vector<unsigned char>& key,
             continue;
         }
         if (n == 0) {
-            break;  // clean end of input: every byte has been fed
-        }
-        if (errno == EINTR) {
-            continue;  // interrupted before any byte arrived; retry
+            break;  // clean end of the message: every byte has been fed
         }
         return HmacStatus::kReadError;
     }
@@ -445,11 +467,17 @@ int prepareAuthentication(const CommandSpec& spec, int argc, char* argv[],
     // A --file value of exactly "-" reads the message from standard input
     // until its normal end; a file literally named "-" stays reachable as
     // "./-" or by full path, and every other value is a file path read the
-    // usual way.
+    // usual way. Either way the bytes go through the one shared
+    // authenticateMessage() above; only the source differs.
     const bool fromStdin = filePath == "-";
-    const HmacStatus status =
-        fromStdin ? hmacSha256Stdin(key, mac, macLength)
-                  : hmacSha256File(key, filePath, mac, macLength);
+    HmacStatus status;
+    if (fromStdin) {
+        StdinMessageSource source;
+        status = authenticateMessage(key, source, mac, macLength);
+    } else {
+        FileMessageSource source(filePath);
+        status = authenticateMessage(key, source, mac, macLength);
+    }
     switch (status) {
         case HmacStatus::kReadError:
             // The partially read prefix must never be authenticated as if
