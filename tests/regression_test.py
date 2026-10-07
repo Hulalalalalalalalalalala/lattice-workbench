@@ -71,6 +71,19 @@ matching prefix or the key; the supplied tag must be exactly 64 hex
 characters (the ``tag`` output with its trailing newline removed, no new
 encapsulation); and parameter format is checked before the file is opened.
 
+The ``--tag-file`` suite pins the file-based tag source: a tag file saved
+straight from ``tag`` output verifies as-is (64 hex characters, any
+casing, ending there or with one LF or CRLF); exactly one of
+--tag-hex/--tag-file must be given (both or neither is exit 2 with the
+verify usage); every deviation from that one-line shape -- surrounding
+whitespace, blank or extra lines, NUL bytes, other lengths, non-hex
+characters -- is exit 2 with the usage and never echoes the file's
+content; an unopenable tag file, and one whose read fails partway (even
+after a complete-looking tag prefix, injected via the read-fault shim),
+is exit 1 with empty stdout; ``--tag-file -`` is a literal file name, not
+standard input; and all tag-file checks run before the message is read,
+so with ``--file -`` they are reported without waiting for input.
+
 The ``--file -`` (standard input) suite pins: piped bytes authenticate to
 the same independently computed tags as the same bytes in a file (empty
 input included); bytes arriving in installments give the same tag and
@@ -1875,6 +1888,406 @@ class VerifyRegression(unittest.TestCase):
                     label=f"verify steps={steps}")
 
 
+class TagFileRegression(unittest.TestCase):
+    """Contract for ``messagetag verify --tag-file <tag-file>``.
+
+    A tag file holds the expected tag as saved from ``messagetag tag``
+    output: exactly 64 hexadecimal characters (either case), ending there
+    or followed by one single LF or CRLF line ending. Exactly one of
+    --tag-hex/--tag-file must be given; the tag file is read and
+    format-checked before the message is read, so with ``--file -`` a bad
+    tag file is reported without waiting for standard input.
+    """
+
+    exe = None
+    tmpdir = None
+    shim_path = None
+    shim = None
+
+    HELLO_LF_TAG = ("307a25cbcb6cbca48f5dd2b05fd9174c0cf17580f4ea8dd667092f11"
+                    "a77b4d5d")
+
+    @classmethod
+    def setUpClass(cls):
+        if not cls.exe or not os.path.isfile(cls.exe):
+            raise RuntimeError("messagetag executable not found: %r" % cls.exe)
+        cls.tmpdir = tempfile.mkdtemp(prefix="messagetag-tagfile-")
+        with open(os.path.join(cls.tmpdir, "msg.bin"), "wb") as f:
+            f.write(b"hello\n")
+        cls.shim = find_read_fault_shim(cls.shim_path, cls.exe, cls.tmpdir)
+
+    @classmethod
+    def tearDownClass(cls):
+        if cls.tmpdir and os.path.isdir(cls.tmpdir):
+            shutil.rmtree(cls.tmpdir, ignore_errors=True)
+
+    # -- helpers ------------------------------------------------------------
+
+    def msg_path(self):
+        return os.path.join(self.tmpdir, "msg.bin")
+
+    _tag_file_seq = 0
+
+    def write_tag_file(self, content):
+        """Materialize ``content`` (bytes) as a fresh tag file."""
+        TagFileRegression._tag_file_seq += 1
+        path = os.path.join(self.tmpdir,
+                            "case-%d.tag" % self._tag_file_seq)
+        with open(path, "wb") as f:
+            f.write(content)
+        return path
+
+    def run_verify(self, key_hex, tag_path, *extra, msg=None, **kwargs):
+        return subprocess.run(
+            [self.exe, "verify", "--key-hex", key_hex,
+             "--file", msg if msg is not None else self.msg_path(),
+             "--tag-file", tag_path, *extra],
+            capture_output=True, **kwargs)
+
+    def assertVerifyOk(self, result, label=""):
+        self.assertEqual(
+            result.returncode, 0,
+            f"{label}: expected exit 0, got {result.returncode}; "
+            f"stderr={result.stderr!r}")
+        self.assertEqual(result.stdout, b"OK\n",
+                         f"{label}: stdout must be exactly b'OK\\n', got "
+                         f"{result.stdout!r}")
+        self.assertEqual(result.stderr, b"",
+                         f"{label}: stderr must be empty, got "
+                         f"{result.stderr!r}")
+
+    def assertUsageError(self, result, label=""):
+        self.assertEqual(
+            result.returncode, 2,
+            f"{label}: expected exit 2, got {result.returncode}; "
+            f"stderr={result.stderr!r}")
+        self.assertEqual(result.stdout, b"",
+                         f"{label}: stdout must be empty, got "
+                         f"{result.stdout!r}")
+        self.assertIn(b"Usage: messagetag verify", result.stderr,
+                      f"{label}: stderr must give the verify usage")
+
+    def assertTagFileReadFailure(self, result, label=""):
+        """An unreadable tag file: exit 1, empty stdout, a read-failure
+        diagnostic (no usage text), and no echo of key or tag material."""
+        self.assertEqual(
+            result.returncode, 1,
+            f"{label}: expected exit 1, got {result.returncode}; "
+            f"stdout={result.stdout!r} stderr={result.stderr!r}")
+        self.assertEqual(result.stdout, b"",
+                         f"{label}: stdout must be empty")
+        self.assertNotEqual(result.stderr, b"",
+                            f"{label}: a read failure must be reported")
+        lower = result.stderr.lower()
+        self.assertIn(b"read", lower,
+                      f"{label}: diagnostic must name the read failure")
+        self.assertIn(b"tag file", lower,
+                      f"{label}: diagnostic must name the tag file")
+        self.assertNotRegex(result.stderr, rb"(?i)[0-9a-f]{64}",
+                            f"{label}: stderr must not contain a tag")
+
+    # -- accepted forms ------------------------------------------------------
+
+    def test_130_tag_command_output_file_verifies_directly(self):
+        """The headline flow: ``tag`` output redirected to a file is
+        accepted by ``verify --tag-file`` as-is -- no stripping, no command
+        substitution."""
+        tag_path = os.path.join(self.tmpdir, "msg.tag")
+        with open(tag_path, "wb") as f:
+            tagged = subprocess.run(
+                [self.exe, "tag", "--key-hex", "0001",
+                 "--file", self.msg_path()], stdout=f, stderr=subprocess.PIPE)
+        self.assertEqual(tagged.returncode, 0, f"stderr={tagged.stderr!r}")
+        with open(tag_path, "rb") as f:
+            saved = f.read()
+        self.assertRegex(saved, TAG_RE,
+                         "the saved file must be the raw tag output line")
+        self.assertVerifyOk(
+            self.run_verify("0001", tag_path), "saved tag output")
+
+    def test_131_accepted_file_forms(self):
+        """64 hex characters alone, or followed by one LF or one CRLF, in
+        any hex-letter casing, all denote the same tag."""
+        tag = self.HELLO_LF_TAG
+        forms = {
+            "no-newline": tag.encode(),
+            "lf": tag.encode() + b"\n",
+            "crlf": tag.encode() + b"\r\n",
+            "upper-lf": tag.upper().encode() + b"\n",
+            "mixed-crlf": "".join(
+                c.upper() if i % 2 == 0 else c
+                for i, c in enumerate(tag)).encode() + b"\r\n",
+        }
+        for name, content in forms.items():
+            with self.subTest(form=name):
+                self.assertVerifyOk(
+                    self.run_verify("0001", self.write_tag_file(content)),
+                    name)
+
+    def test_132_mismatch_and_wrong_key_via_tag_file(self):
+        """A well-formed tag file whose tag does not match is an ordinary
+        authentication failure: exit 3, empty stdout, no cause assigned,
+        no key or tag echoed -- exactly as with --tag-hex."""
+        flipped = self.HELLO_LF_TAG[:-1] + "c"
+        path = self.write_tag_file(flipped.encode() + b"\n")
+        r = self.run_verify("0001", path)
+        self.assertEqual(r.returncode, 3,
+                         f"stderr={r.stderr!r}")
+        self.assertEqual(r.stdout, b"")
+        self.assertIn(b"mismatch", r.stderr.lower())
+        self.assertNotRegex(r.stderr, rb"(?i)[0-9a-f]{64}")
+        # Same file, wrong key: also a plain mismatch.
+        r = self.run_verify(
+            "0002", self.write_tag_file(self.HELLO_LF_TAG.encode() + b"\n"))
+        self.assertEqual(r.returncode, 3)
+        self.assertEqual(r.stdout, b"")
+
+    def test_133_tag_file_matches_tag_hex_result(self):
+        """The same tag given via --tag-file and via --tag-hex leads to the
+        same verification result."""
+        path = self.write_tag_file(self.HELLO_LF_TAG.encode() + b"\n")
+        via_file = self.run_verify("0001", path)
+        via_hex = subprocess.run(
+            [self.exe, "verify", "--key-hex", "0001",
+             "--file", self.msg_path(), "--tag-hex", self.HELLO_LF_TAG],
+            capture_output=True)
+        self.assertVerifyOk(via_file, "--tag-file")
+        self.assertVerifyOk(via_hex, "--tag-hex")
+
+    # -- exactly one tag source ----------------------------------------------
+
+    def test_134_exactly_one_tag_source_required(self):
+        """--tag-hex and --tag-file together are a conflict; neither leaves
+        the tag without a source. Both are exit 2 with empty stdout and the
+        verify usage, reported before any file is read (the message file
+        does not exist here)."""
+        tag_path = self.write_tag_file(self.HELLO_LF_TAG.encode() + b"\n")
+        missing_msg = os.path.join(self.tmpdir, "no-such-message.bin")
+        invocations = [
+            [self.exe, "verify", "--key-hex", "0001",
+             "--file", self.msg_path(),
+             "--tag-hex", self.HELLO_LF_TAG, "--tag-file", tag_path],
+            [self.exe, "verify", "--key-hex", "0001",
+             "--file", self.msg_path(),
+             "--tag-file", tag_path, "--tag-hex", self.HELLO_LF_TAG],
+            # The conflict is reported even when the message file is
+            # missing and even when one side's value is malformed.
+            [self.exe, "verify", "--key-hex", "0001", "--file", missing_msg,
+             "--tag-hex", self.HELLO_LF_TAG, "--tag-file", tag_path],
+            [self.exe, "verify", "--key-hex", "0001", "--file", missing_msg,
+             "--tag-hex", "abc", "--tag-file", tag_path],
+            # Neither source (message file missing: still the parameter
+            # error, not a read failure).
+            [self.exe, "verify", "--key-hex", "0001", "--file", missing_msg],
+        ]
+        for argv in invocations:
+            with self.subTest(argv=argv[2:]):
+                r = subprocess.run(argv, capture_output=True)
+                self.assertUsageError(r, repr(argv[2:]))
+                self.assertNotRegex(r.stderr, rb"(?i)[0-9a-f]{64}")
+
+    # -- tag file format errors ------------------------------------------------
+
+    def test_135_malformed_tag_files_exit_2(self):
+        """Everything beyond "64 hex chars, optional single LF/CRLF" is a
+        format error: exit 2, empty stdout, the verify usage, and no echo
+        of the file's content (several bad files embed the valid tag)."""
+        tag = self.HELLO_LF_TAG.encode()
+        bad = [
+            b"",                       # empty file
+            b"\n",                     # only a newline
+            tag[:-1],                  # 63 chars
+            tag[:-2],                  # 62 chars
+            tag[:32],                  # 16 bytes
+            tag + b"a",                # 65 chars
+            tag + b"aa",               # 66 chars, all hex but 33 bytes
+            b"0x" + tag,               # 0x prefix
+            b" " + tag,                # leading space
+            tag + b" ",                # trailing space
+            tag + b" \n",              # space before the newline
+            b" " + tag + b"\n",        # leading space, valid ending
+            tag[:10] + b" " + tag[11:],  # embedded space
+            b"\n" + tag,               # leading blank line
+            tag + b"\n\n",             # trailing blank line
+            tag + b"\nsecond-line",    # content on a second line
+            tag + b"\n" + tag,         # a whole second tag line
+            tag + b"\r",               # CR alone is not a line ending
+            tag + b"\n\r",             # LF-CR is not CRLF
+            tag + b"\r\n\r\n",         # two line endings
+            tag + b"\r\n\n",           # CRLF plus LF
+            tag[:32] + b"\x00" + tag[33:],      # NUL byte inside
+            tag + b"\n\x00",           # NUL after the newline
+            tag[:-1] + b"g",           # non-hex character
+            b"z" * 64,                 # right length, no hex at all
+            tag[:-1] + b"G",           # G is not hex
+        ]
+        for content in bad:
+            with self.subTest(content=content[:20]):
+                r = self.run_verify("0001", self.write_tag_file(content))
+                self.assertUsageError(r, repr(content[:20]))
+                # The file's content (including an embedded valid tag) must
+                # not be echoed back.
+                self.assertNotRegex(r.stderr, rb"(?i)[0-9a-f]{64}")
+                self.assertNotIn(tag, r.stderr)
+
+    def test_136_format_checked_before_message_is_read(self):
+        """A malformed tag file is a parameter error even when the message
+        file does not exist: tag-file validation precedes message reading,
+        so this is exit 2, not a message read failure (1) or mismatch (3).
+        An unreadable tag file likewise wins over the missing message with
+        its own exit-1 read diagnostic."""
+        missing_msg = os.path.join(self.tmpdir, "no-such-message.bin")
+        self.assertFalse(os.path.exists(missing_msg))
+        bad_tag = self.write_tag_file(b"not-a-tag\n")
+        r = self.run_verify("0001", bad_tag, msg=missing_msg)
+        self.assertUsageError(r, "bad tag file, missing message")
+        # Unreadable tag file + missing message: the tag file's own
+        # exit-1 read failure, not the message's.
+        missing_tag = os.path.join(self.tmpdir, "no-such-tag.tag")
+        r = self.run_verify("0001", missing_tag, msg=missing_msg)
+        self.assertTagFileReadFailure(r, "unreadable tag, missing message")
+        self.assertIn(missing_tag.encode(), r.stderr)
+        # A bad key is still reported before the tag file is consulted.
+        r = self.run_verify(
+            "zz", self.write_tag_file(self.HELLO_LF_TAG.encode() + b"\n"))
+        self.assertUsageError(r, "bad key")
+
+    # -- unreadable and partially readable tag files --------------------------
+
+    def test_137_unreadable_tag_file_exit_1(self):
+        """A tag file that cannot be opened is exit 1 with empty stdout and
+        a read diagnostic naming the tag file -- distinct from a format
+        error (2) and from a mismatch (3)."""
+        missing = os.path.join(self.tmpdir, "does-not-exist.tag")
+        r = self.run_verify("0001", missing)
+        self.assertTagFileReadFailure(r, "missing tag file")
+        self.assertIn(missing.encode(), r.stderr)
+
+        if os.geteuid() != 0:
+            locked = self.write_tag_file(self.HELLO_LF_TAG.encode() + b"\n")
+            os.chmod(locked, 0)
+            try:
+                r = self.run_verify("0001", locked)
+                self.assertTagFileReadFailure(r, "unreadable tag file")
+            finally:
+                os.chmod(locked, stat.S_IRUSR | stat.S_IWUSR)
+
+    def test_138_read_error_after_partial_tag_file(self):
+        """Open succeeds, a prefix of the tag file is delivered, then the
+        read fails. Even when the delivered prefix is by itself a complete,
+        correct-looking tag (fail_after=64 on a 65-byte file), it must not
+        be used: the run is exit 1 with empty stdout and a read diagnostic,
+        never OK and never a mismatch."""
+        if self.shim is None:
+            self.skipTest("read-fault shim not available (build with CMake "
+                          "or pass its path as the second argument)")
+        if not os.path.exists("/proc/self/fd"):
+            self.skipTest("read-fault shim needs /proc/self/fd (Linux)")
+
+        tag_path = self.write_tag_file(self.HELLO_LF_TAG.encode() + b"\n")
+
+        env = dict(os.environ)
+        env["LD_PRELOAD"] = self.shim
+        # Control: shim loaded but aimed at a different path must not
+        # disturb a normal run (and proves the shim is loaded below).
+        env["MESSAGETAG_READ_FAULT_PATH"] = tag_path + ".not-the-target"
+        env["MESSAGETAG_READ_FAULT_AFTER"] = "1"
+        self.assertVerifyOk(
+            self.run_verify("0001", tag_path, env=env), "shim control run")
+
+        env["MESSAGETAG_READ_FAULT_PATH"] = tag_path
+        for fail_after in (1, 10, 63, 64, 65):
+            with self.subTest(fail_after=fail_after):
+                env["MESSAGETAG_READ_FAULT_AFTER"] = str(fail_after)
+                r = self.run_verify("0001", tag_path, env=env)
+                self.assertTagFileReadFailure(
+                    r, f"fail_after={fail_after}")
+                self.assertNotIn(self.HELLO_LF_TAG.encode(), r.stderr)
+
+    # -- the tag-file path is always a plain file name ------------------------
+
+    def test_139_dash_tag_file_is_a_literal_filename(self):
+        """"--tag-file -" does not read standard input: a single dash is a
+        file name like any other. With no file named "-" it is an ordinary
+        read failure (exit 1) even while standard input stays open; with a
+        file literally named "-" that file is used."""
+        dash_dir = os.path.join(self.tmpdir, "dashdir")
+        os.makedirs(dash_dir, exist_ok=True)
+        argv = [self.exe, "verify", "--key-hex", "0001",
+                "--file", self.msg_path(), "--tag-file", "-"]
+        # No file named "-": exit 1 promptly, without consuming the
+        # never-ending standard input.
+        proc = subprocess.Popen(
+            argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, cwd=dash_dir)
+        try:
+            rc = proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.communicate()
+            self.fail("--tag-file - must not read standard input")
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+        stdout = proc.stdout.read()
+        stderr = proc.stderr.read()
+        proc.stdin.close()
+        self.assertEqual(rc, 1, f"stderr={stderr!r}")
+        self.assertEqual(stdout, b"")
+        self.assertIn(b"read", stderr.lower())
+        # A file literally named "-" is read as the tag file.
+        with open(os.path.join(dash_dir, "-"), "wb") as f:
+            f.write(self.HELLO_LF_TAG.encode() + b"\n")
+        r = subprocess.run(argv, input=b"ignored stdin bytes\n",
+                           capture_output=True, cwd=dash_dir)
+        self.assertVerifyOk(r, "tag file named -")
+
+    # -- no waiting for the message when the tag file is bad ------------------
+
+    def test_140_tag_file_errors_do_not_wait_for_stdin(self):
+        """With ``--file -``, an invalid or unreadable tag file is reported
+        (exit 2 / exit 1) before any message byte is read: the command must
+        not block on a standard input that never ends. A valid tag file
+        plus piped message bytes verifies normally."""
+        bad_tag = self.write_tag_file(b"not-a-tag\n")
+        missing_tag = os.path.join(self.tmpdir, "no-such-tag.tag")
+        cases = [
+            (["--tag-file", bad_tag], 2),
+            (["--tag-file", missing_tag], 1),
+            # The source conflict is also settled before the message.
+            (["--tag-hex", self.HELLO_LF_TAG, "--tag-file", bad_tag], 2),
+        ]
+        for tag_args, want_rc in cases:
+            argv = [self.exe, "verify", "--key-hex", "0001", "--file", "-",
+                    *tag_args]
+            with self.subTest(argv=argv[2:]):
+                proc = subprocess.Popen(
+                    argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE)
+                try:
+                    # The write end of stdin stays open the whole time; a
+                    # command that read the message first would block here.
+                    rc = proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.communicate()
+                    self.fail(f"{argv[2:]}: tag-file error must be reported "
+                              f"without waiting for standard input")
+                finally:
+                    if proc.poll() is None:
+                        proc.kill()
+                stdout = proc.stdout.read()
+                stderr = proc.stderr.read()
+                proc.stdin.close()
+                self.assertEqual(rc, want_rc,
+                                 f"{argv[2:]}: stderr={stderr!r}")
+                self.assertEqual(stdout, b"")
+        # And the normal stdin flow with a tag file works.
+        good_tag = self.write_tag_file(self.HELLO_LF_TAG.encode() + b"\n")
+        r = self.run_verify("0001", good_tag, msg="-", input=b"hello\n")
+        self.assertVerifyOk(r, "tag file + message from stdin")
+
+
 class StdinRegression(unittest.TestCase):
     """Contract for ``--file -``: the message comes from standard input.
 
@@ -3051,6 +3464,9 @@ def main():
     VerifyRegression.tmpdir = None
     VerifyRegression.shim_path = TagRegression.shim_path
     VerifyRegression.write_shim_path = TagRegression.write_shim_path
+    TagFileRegression.exe = TagRegression.exe
+    TagFileRegression.tmpdir = None
+    TagFileRegression.shim_path = TagRegression.shim_path
     StdinRegression.exe = TagRegression.exe
     StdinRegression.tmpdir = None
     StdinRegression.shim_path = TagRegression.shim_path
@@ -3062,6 +3478,7 @@ def main():
     suite = unittest.TestSuite([
         loader.loadTestsFromTestCase(TagRegression),
         loader.loadTestsFromTestCase(VerifyRegression),
+        loader.loadTestsFromTestCase(TagFileRegression),
         loader.loadTestsFromTestCase(StdinRegression),
         loader.loadTestsFromTestCase(KeyBoundaryRegression),
     ])

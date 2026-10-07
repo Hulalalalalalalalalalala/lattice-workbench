@@ -16,6 +16,7 @@
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <iterator>
 #include <map>
 #include <memory>
 #include <string>
@@ -33,9 +34,11 @@ constexpr std::string_view kTagUsage =
 
 constexpr std::string_view kVerifyUsage =
     "Usage: messagetag verify --key-hex <hex-key> --file <message-file> "
-    "--tag-hex <hex-tag>\n"
+    "(--tag-hex <hex-tag> | --tag-file <tag-file>)\n"
     "       (a <message-file> of exactly '-' reads the message from "
-    "standard input)\n";
+    "standard input;\n"
+    "       exactly one of --tag-hex or --tag-file supplies the expected "
+    "tag)\n";
 
 // Per-command identity for the shared option/prepare/authenticate flow:
 // the name spliced into diagnostics, that command's own usage line and
@@ -58,7 +61,7 @@ const CommandSpec& tagSpec() {
 const CommandSpec& verifySpec() {
     static const CommandSpec spec{
         "verify", kVerifyUsage,
-        {"--key-hex", "--file", "--tag-hex"}};
+        {"--key-hex", "--file", "--tag-hex", "--tag-file"}};
     return spec;
 }
 
@@ -224,6 +227,62 @@ bool parseKey(const CommandSpec& spec, const std::string& keyHex,
                  "be kept; a 0x prefix and whitespace are not accepted\n"
               << spec.usage;
     return false;
+}
+
+// The outcome of sourcing the expected tag from a --tag-file file.
+enum class TagFileStatus { kOk, kReadError, kFormatError };
+
+// Read and validate a tag file: exactly 64 hexadecimal characters (either
+// case) denoting the 32-byte tag, ending right there or followed by one
+// single LF or CRLF line ending and nothing more. This is precisely what
+// "messagetag tag ... > file" writes, so a saved tag file verifies without
+// any manual stripping. Leading/trailing spaces, blank lines, a second
+// line, NUL bytes, any other length and non-hexadecimal characters are all
+// format errors; the file content is never echoed back.
+//
+// The path is always a plain file name: unlike --file, a lone "-" is NOT
+// standard input here. A file that cannot be opened, or one whose read
+// fails partway, is a read error -- and the bytes read up to that point
+// are discarded even when they happen to look like a complete tag, so a
+// truncated read can never be verified against. The file is tiny (66 bytes
+// at most when valid), so reading it whole is no burden; reading to the
+// end also means a failure anywhere in the file is still reported as a
+// read error rather than being masked by the format check.
+TagFileStatus readTagFile(const std::string& path,
+                          std::vector<unsigned char>& tag) {
+    std::ifstream in(path, std::ios::binary | std::ios::in);
+    if (!in) {
+        return TagFileStatus::kReadError;
+    }
+    // Read the whole file. istreambuf_iterator reads straight from the
+    // streambuf, where libstdc++'s filebuf reports a failed read by
+    // throwing ios_base::failure (unlike istream::read, which translates
+    // that into badbit); catch it so a mid-read failure is the read error
+    // it is, not an uncaught exception. Where the implementation instead
+    // only sets state bits, bad() below catches the same failure.
+    std::string content;
+    try {
+        content.assign(std::istreambuf_iterator<char>(in),
+                       std::istreambuf_iterator<char>());
+    } catch (const std::ios_base::failure&) {
+        return TagFileStatus::kReadError;
+    }
+    if (in.bad()) {
+        // A read failed partway: the partial content, however complete it
+        // looks, must not be used.
+        return TagFileStatus::kReadError;
+    }
+    std::string_view hex(content);
+    if (hex.size() >= 2 && hex.compare(hex.size() - 2, 2, "\r\n") == 0) {
+        hex.remove_suffix(2);
+    } else if (!hex.empty() && hex.back() == '\n') {
+        hex.remove_suffix(1);
+    }
+    if (hex.size() != 2 * kTagBytes || !decodeHex(hex, tag) ||
+        tag.size() != kTagBytes) {
+        return TagFileStatus::kFormatError;
+    }
+    return TagFileStatus::kOk;
 }
 
 // The outcome of authenticating one message: the tag was produced, the
@@ -392,8 +451,8 @@ HmacStatus authenticateMessage(const std::vector<unsigned char>& key,
 // Output of the shared preparation stage that the command-specific
 // decision still needs afterwards.
 struct PreparedAuthentication {
-    // verify only: the supplied --tag-hex decoded to 32 bytes; unused by
-    // tag, which has no tag to compare against.
+    // verify only: the expected tag (from --tag-hex or --tag-file) decoded
+    // to 32 bytes; unused by tag, which has no tag to compare against.
     std::vector<unsigned char> expectedTag;
 };
 
@@ -403,12 +462,16 @@ struct PreparedAuthentication {
 //
 //   1. parse exactly this command's value-taking options (unknown argument
 //      or missing value -> exit 2 with that command's usage);
-//   2. require --key-hex/--file, and additionally --tag-hex when
-//      `expectTag` is set (exit 2);
-//   3. decode the key, and the supplied tag for verify, BEFORE the message
-//      source is touched, so a malformed key/tag is a parameter error
-//      (exit 2) even when the file does not exist -- and, with "--file -",
-//      without waiting for standard input to arrive or end;
+//   2. require --key-hex/--file, and for verify (`expectTag`) exactly one
+//      tag source: --tag-hex or --tag-file -- both or neither is a source
+//      conflict/missing error (exit 2);
+//   3. decode the key, and source the supplied tag for verify (decode
+//      --tag-hex, or read and validate the --tag-file file), BEFORE the
+//      message source is touched, so a malformed key/tag or tag file is a
+//      parameter error (exit 2) -- and an unreadable tag file a read
+//      failure (exit 1) -- even when the message file does not exist, and,
+//      with "--file -", without waiting for standard input to arrive or
+//      end;
 //   4. stream the whole message through HMAC-SHA-256, from the named file
 //      or -- when --file is exactly "-" -- from standard input until its
 //      normal end (read or computation failure -> exit 1, with no result
@@ -431,8 +494,22 @@ int prepareAuthentication(const CommandSpec& spec, int argc, char* argv[],
         return 2;
     }
     if (!requireOption(spec, opts, "--key-hex") ||
-        !requireOption(spec, opts, "--file") ||
-        (expectTag && !requireOption(spec, opts, "--tag-hex"))) {
+        !requireOption(spec, opts, "--file")) {
+        return 2;
+    }
+    const bool hasTagHex = opts.find("--tag-hex") != opts.end();
+    const bool hasTagFile = opts.find("--tag-file") != opts.end();
+    if (expectTag && hasTagHex == hasTagFile) {
+        // Exactly one tag source must be given: both is a conflict,
+        // neither leaves the expected tag without a source.
+        std::cerr << "messagetag " << spec.name << ": error: "
+                  << (hasTagHex
+                          ? "conflicting tag sources: '--tag-hex' and "
+                            "'--tag-file' cannot be used together"
+                          : "missing tag source: exactly one of '--tag-hex' "
+                            "or '--tag-file' is required")
+                  << "\n"
+                  << spec.usage;
         return 2;
     }
     const std::string& keyHex = opts["--key-hex"];
@@ -448,19 +525,53 @@ int prepareAuthentication(const CommandSpec& spec, int argc, char* argv[],
     }
 
     if (expectTag) {
-        // The supplied tag must decode to exactly 32 bytes (64 hex
-        // characters); decodeHex already rejects empty input, odd length,
-        // non-hex characters and whitespace, which also rules out a 0x
-        // prefix. The submitted tag is deliberately not echoed back.
-        if (!decodeHex(opts["--tag-hex"], prepared.expectedTag) ||
-            prepared.expectedTag.size() != kTagBytes) {
-            std::cerr << "messagetag " << spec.name
-                      << ": error: invalid --tag-hex: expected exactly 64 "
-                         "hexadecimal characters denoting 32 bytes (0-9, a-f, "
-                         "A-F); empty, truncated or over-long values, embedded "
-                         "whitespace and a 0x prefix are not accepted\n"
-                      << spec.usage;
-            return 2;
+        if (hasTagHex) {
+            // The supplied tag must decode to exactly 32 bytes (64 hex
+            // characters); decodeHex already rejects empty input, odd
+            // length, non-hex characters and whitespace, which also rules
+            // out a 0x prefix. The submitted tag is deliberately not
+            // echoed back.
+            if (!decodeHex(opts["--tag-hex"], prepared.expectedTag) ||
+                prepared.expectedTag.size() != kTagBytes) {
+                std::cerr << "messagetag " << spec.name
+                          << ": error: invalid --tag-hex: expected exactly 64 "
+                             "hexadecimal characters denoting 32 bytes (0-9, "
+                             "a-f, A-F); empty, truncated or over-long "
+                             "values, embedded whitespace and a 0x prefix "
+                             "are not accepted\n"
+                          << spec.usage;
+                return 2;
+            }
+        } else {
+            // --tag-file: the tag comes from a file, e.g. one saved from
+            // "messagetag tag" output. The path is always a plain file
+            // name (a lone "-" is not standard input here). Reading and
+            // format-checking it still happens before the message source
+            // is touched. The diagnostic may name the path and the reason,
+            // but never echoes the file's content.
+            const std::string& tagPath = opts["--tag-file"];
+            switch (readTagFile(tagPath, prepared.expectedTag)) {
+                case TagFileStatus::kOk:
+                    break;
+                case TagFileStatus::kReadError:
+                    std::cerr << "messagetag " << spec.name
+                              << ": error: failed to read tag file: "
+                              << tagPath << "\n";
+                    return 1;
+                case TagFileStatus::kFormatError:
+                    std::cerr << "messagetag " << spec.name
+                              << ": error: invalid tag file '" << tagPath
+                              << "': expected exactly 64 hexadecimal "
+                                 "characters denoting the 32-byte tag (0-9, "
+                                 "a-f, A-F), ending there or followed by a "
+                                 "single LF or CRLF line ending; "
+                                 "leading/trailing whitespace, blank or "
+                                 "extra lines, NUL bytes, other lengths and "
+                                 "non-hexadecimal characters are not "
+                                 "accepted\n"
+                              << spec.usage;
+                    return 2;
+            }
         }
     }
 
@@ -590,7 +701,8 @@ int main(int argc, char* argv[]) {
               << "       messagetag tag --key-hex <hex-key> "
                  "--file <message-file>\n"
               << "       messagetag verify --key-hex <hex-key> "
-                 "--file <message-file> --tag-hex <hex-tag>\n"
+                 "--file <message-file> (--tag-hex <hex-tag> | "
+                 "--tag-file <tag-file>)\n"
               << "       (a <message-file> of exactly '-' reads the message "
                  "from standard input)\n";
     return 2;
