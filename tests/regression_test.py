@@ -87,6 +87,20 @@ error arriving after such recovery keeps exit 1 with empty stdout and the
 standard-input read diagnostic, even when verify's supplied tag matches
 the prefix received so far.
 
+Key handling at the 64-byte SHA-256 block-size boundary is pinned against
+the same independent bases (hard-coded constants re-derived from Python's
+hmac/hashlib at runtime): zero bytes appended to a non-empty key of at
+most 64 decoded bytes (63 padded to exactly 64 included) cannot change
+the tag and the padded forms cross-verify; one zero byte further (65
+bytes) crosses the block size, so the key is hashed and yields the
+standard long-key tag -- identical to its SHA-256 digest supplied as a
+32-byte key -- and the original tag is a plain mismatch for it; a key of
+exactly 64 bytes is used as-is and differs from its own digest as a key,
+while longer keys match their digest as a key; the digest is supplied as
+the hex of its raw 32 bytes, never as the digest text's characters; and
+the empty key stays a parameter error. All relations hold on the empty
+message and on a NUL-containing message, from file and standard input.
+
 Usage:
 
     python3 tests/regression_test.py /path/to/messagetag \
@@ -230,6 +244,79 @@ PROJECT_VECTORS += [
     ("block1_plus",  LARGE_KEY_HEX, stream_bytes(READ_CHUNK + 1),
      "df45b0a2bfba857c7aaee155f1f5677d2e506b6f008774caf3e5d88f940ec9cf"),
 ]
+
+# ---------------------------------------------------------------------------
+# Keys at the 64-byte SHA-256 block-size boundary
+#
+# RFC 2104 key normalization, which every conforming HMAC implementation
+# applies: a key of at most 64 bytes is zero-padded to the 64-byte block
+# (appending zero bytes to such a key cannot change the tag), while a key
+# longer than 64 bytes is first replaced by its SHA-256 digest (it then
+# authenticates exactly like that 32-byte digest used as the key). A key of
+# exactly 64 bytes is used as-is and is NOT interchangeable with its own
+# digest. Key lengths here are always decoded-byte lengths: 64 key bytes
+# are 128 hex characters on the command line.
+# ---------------------------------------------------------------------------
+
+KB_MESSAGES = {
+    # Every relation must hold on the empty message and on a non-empty
+    # message containing zero bytes with content after them alike.
+    "empty": b"",
+    "nul": b"\x00key-boundary\x00tail",
+}
+
+KB_SHORT = "0b" * 20                     # 20-byte key
+KB_KEY63 = bytes(range(1, 64)).hex()     # 63 bytes: 01 02 ... 3e 3f
+KB_KEY64 = KB_KEY63 + "00"               # zero-padded to exactly 64 bytes
+KB_KEY65 = KB_KEY63 + "0000"             # one zero byte past the boundary
+KB_LONG = bytes((i * 7 + 2) % 256
+                for i in range(100)).hex()   # 100 bytes: well past it
+KB_ZERO1 = "00"                          # a single zero byte: a legal key
+KB_ZERO64 = "00" * 64                    # its zero-padded form at the boundary
+KB_ZERO65 = "00" * 65                    # one zero byte past it
+
+# SHA-256 digests of the raw key bytes, themselves usable as 32-byte keys.
+# They reach --key-hex as the hexadecimal of the 32 digest bytes (64 hex
+# characters) -- never as the digest's hexadecimal *text*.
+KB_KEY64_DIGEST = hashlib.sha256(bytes.fromhex(KB_KEY64)).hexdigest()
+KB_KEY65_DIGEST = hashlib.sha256(bytes.fromhex(KB_KEY65)).hexdigest()
+KB_LONG_DIGEST = hashlib.sha256(bytes.fromhex(KB_LONG)).hexdigest()
+
+# Hard-coded expected tags for the boundary keys, computed independently of
+# the program with Python's hmac/hashlib and re-derived at runtime by
+# KeyBoundaryRegression.test_120. Only distinct values appear: a padded or
+# digest form shares its base key's standard tag by definition, and the
+# suite proves the program reproduces that sharing rather than assuming it.
+KB_TAGS = {
+    ("empty", "short"):
+        "999a901219f032cd497cadb5e6051e97b6a29ab297bd6ae722bd6062a2f59542",
+    ("empty", "k63"):
+        "6d3f298be7bae388fd14e89cc2343c2aecb21cc32528bbc5fb7b088330411e99",
+    ("empty", "k65"):
+        "8fad81043946ebc2c9dab07dd2e63002e4f9ba5f8c2e83a14172281bf71d73a7",
+    ("empty", "k64digest"):
+        "6f629726d25f724ac335c3eee5c508a80e5abd76196ea92a52973dc93f577834",
+    ("empty", "long"):
+        "f3f5b57698dc2d4662795bf2a3baafb20c9faac11e69b7835d7c44ce4fd6b0ad",
+    ("empty", "zero"):
+        "b613679a0814d9ec772f95d778c35fc5ff1697c493715653c6c712144292c5ad",
+    ("empty", "zero65"):
+        "2dc19480eae3a02d634b585f777b82d13b92d3683016bb3266718cc5e8089417",
+    ("nul", "short"):
+        "9ec678925ddd43fd76a2357452a1f5ef8289d1a00472566f1a427c051ca4722a",
+    ("nul", "k63"):
+        "f9daccf42b6296e9b4dbdac12b773781d5f1cc783c06d36792df5d1dd9d59d58",
+    ("nul", "k65"):
+        "ff919a5aff633b948b892f449ba1a4385b18dbfeb37a7e6be28a86909115d431",
+    ("nul", "k64digest"):
+        "07eb39fa5ed965d6d01ebd8ca8c57fe66d9c7c644a66cce956052476853770e2",
+    ("nul", "long"):
+        "3e02e3c73deeeb1caeac231ff34c82999ede6f3ffe32ad6aaf79c04832dfb5f1",
+    ("nul", "zero"):
+        "ac4a277bece14e672cb30768c40d74926a6a76f9df8c2a93c167a6840f4328f9",
+    ("nul", "zero65"):
+        "4e0b6c12ae88174163a3e9c43b98ce34563b9fbaf2c337617e222aeec5eae8ec",
+}
 
 TAG_RE = re.compile(rb"\A[0-9a-f]{64}\n\Z")
 
@@ -2524,6 +2611,394 @@ class StdinRegression(unittest.TestCase):
               b"OK\n")
 
 
+class KeyBoundaryRegression(unittest.TestCase):
+    """RFC 2104 key normalization at the 64-byte SHA-256 block boundary.
+
+    Pins, for both commands and for file and standard-input messages:
+
+    - appending zero bytes to a non-empty key of at most 64 decoded bytes
+      (staying at or below 64) cannot change the tag, and all such padded
+      forms cross-verify one tag -- including 63 bytes padded to exactly 64;
+    - one zero byte further (65 bytes) crosses the block size: the key is
+      hashed and yields the standard long-key tag, identical to its
+      SHA-256 digest used as a 32-byte key, and the original tag is a
+      plain mismatch for it;
+    - a key of exactly 64 bytes is used as-is and differs from its own
+      SHA-256 digest as a key, while a key longer than 64 bytes matches
+      its digest as a key and cross-verifies with it;
+    - the digest reaches --key-hex as the hex of its raw 32 bytes, never
+      as the digest text's character bytes;
+    - the empty key stays a parameter error (exit 2) -- the zero-padding
+      relation never makes it a legal key.
+
+    Expected tags are the hard-coded KB_TAGS constants, re-derived from
+    Python's hmac/hashlib (an implementation unrelated to the program) in
+    test_120; the program's own output is never the oracle, and a tag
+    printed by ``tag`` is never the sole basis for a ``verify`` verdict.
+    """
+
+    exe = None
+    tmpdir = None
+
+    # Padded forms of the 20-byte key: 20, 21, 32, 63 and 64 decoded bytes
+    # -- all at or below the 64-byte block, hence all the same standard key.
+    SHORT_PADDED = [KB_SHORT + "00" * n for n in (0, 1, 12, 43, 44)]
+
+    @classmethod
+    def setUpClass(cls):
+        if not cls.exe or not os.path.isfile(cls.exe):
+            raise RuntimeError("messagetag executable not found: %r" % cls.exe)
+        cls.tmpdir = tempfile.mkdtemp(prefix="messagetag-keyboundary-")
+        for name, data in KB_MESSAGES.items():
+            with open(os.path.join(cls.tmpdir, name + ".bin"), "wb") as f:
+                f.write(data)
+
+    @classmethod
+    def tearDownClass(cls):
+        if cls.tmpdir and os.path.isdir(cls.tmpdir):
+            shutil.rmtree(cls.tmpdir, ignore_errors=True)
+
+    # -- helpers ------------------------------------------------------------
+
+    def msg_file(self, name):
+        return os.path.join(self.tmpdir, name + ".bin")
+
+    def run_tag(self, key_hex, msg_name):
+        return subprocess.run(
+            [self.exe, "tag", "--key-hex", key_hex,
+             "--file", self.msg_file(msg_name)], capture_output=True)
+
+    def run_tag_stdin(self, key_hex, msg_name):
+        return subprocess.run(
+            [self.exe, "tag", "--key-hex", key_hex, "--file", "-"],
+            input=KB_MESSAGES[msg_name], capture_output=True)
+
+    def run_verify(self, key_hex, msg_name, tag_hex):
+        return subprocess.run(
+            [self.exe, "verify", "--key-hex", key_hex,
+             "--file", self.msg_file(msg_name), "--tag-hex", tag_hex],
+            capture_output=True)
+
+    def run_verify_stdin(self, key_hex, msg_name, tag_hex):
+        return subprocess.run(
+            [self.exe, "verify", "--key-hex", key_hex, "--file", "-",
+             "--tag-hex", tag_hex],
+            input=KB_MESSAGES[msg_name], capture_output=True)
+
+    def assertTagSuccess(self, result, expected_tag, label=""):
+        self.assertEqual(
+            result.returncode, 0,
+            f"{label}: expected exit 0, got {result.returncode}; "
+            f"stderr={result.stderr!r}")
+        self.assertEqual(result.stderr, b"",
+                         f"{label}: stderr must be empty, got "
+                         f"{result.stderr!r}")
+        self.assertRegex(result.stdout, TAG_RE,
+                         f"{label}: stdout must be 64 lowercase hex chars "
+                         f"+ newline, got {result.stdout!r}")
+        self.assertEqual(result.stdout, expected_tag.encode() + b"\n",
+                         f"{label}: wrong tag")
+
+    def assertVerifyOk(self, result, label=""):
+        self.assertEqual(
+            result.returncode, 0,
+            f"{label}: expected exit 0, got {result.returncode}; "
+            f"stderr={result.stderr!r}")
+        self.assertEqual(result.stdout, b"OK\n",
+                         f"{label}: stdout must be exactly b'OK\\n', got "
+                         f"{result.stdout!r}")
+        self.assertEqual(result.stderr, b"",
+                         f"{label}: stderr must be empty, got "
+                         f"{result.stderr!r}")
+
+    def assertMismatch(self, result, key_hex, tag_hex, label=""):
+        """A legal but non-matching combination: exit 3, empty stdout, and
+        a diagnostic that states the mismatch without assigning a cause
+        and without leaking the key, the supplied tag or a recomputed
+        tag."""
+        self.assertEqual(
+            result.returncode, 3,
+            f"{label}: expected exit 3, got {result.returncode}; "
+            f"stdout={result.stdout!r} stderr={result.stderr!r}")
+        self.assertEqual(result.stdout, b"",
+                         f"{label}: stdout must carry no bytes on mismatch")
+        self.assertNotEqual(result.stderr, b"",
+                            f"{label}: a mismatch diagnostic is required")
+        lower = result.stderr.lower()
+        self.assertIn(b"mismatch", lower,
+                      f"{label}: diagnostic must state the mismatch")
+        for forbidden in (b"wrong key", b"bad key", b"incorrect key",
+                          b"tamper", b"modif", b"corrupt"):
+            self.assertNotIn(forbidden, lower,
+                             f"{label}: diagnostic must not claim a "
+                             f"specific cause ({forbidden!r})")
+        self.assertNotRegex(result.stderr, rb"(?i)[0-9a-f]{64}",
+                            f"{label}: stderr must not contain a "
+                            f"recomputed/echoed tag")
+        self.assertNotIn(tag_hex.lower().encode(), lower,
+                         f"{label}: the supplied tag must not be echoed")
+        self.assertNotIn(key_hex.lower().encode(), lower,
+                         f"{label}: key material must not be echoed")
+
+    # -- independent basis and standard relations ----------------------------
+
+    def test_120_constants_match_stdlib_and_distinguish(self):
+        """Every hard-coded KB_TAGS constant equals Python stdlib HMAC over
+        the recipe, the standard normalization relations hold on the
+        stdlib side, and the chosen keys/messages genuinely distinguish
+        what must differ (so the mismatch tests below are not vacuous)."""
+        key_for = {
+            "short": KB_SHORT, "k63": KB_KEY63, "k65": KB_KEY65,
+            "k64digest": KB_KEY64_DIGEST, "long": KB_LONG,
+            "zero": KB_ZERO1, "zero65": KB_ZERO65,
+        }
+        # The boundary counts decoded bytes, not hex characters.
+        self.assertEqual(len(bytes.fromhex(KB_SHORT)), 20)
+        self.assertEqual(len(bytes.fromhex(KB_KEY63)), 63)
+        self.assertEqual(len(bytes.fromhex(KB_KEY64)), 64)
+        self.assertEqual(len(bytes.fromhex(KB_KEY65)), 65)
+        self.assertEqual(len(bytes.fromhex(KB_LONG)), 100)
+        for digest in (KB_KEY64_DIGEST, KB_KEY65_DIGEST, KB_LONG_DIGEST):
+            self.assertEqual(len(bytes.fromhex(digest)), 32)
+        for (msg_name, label), tag in KB_TAGS.items():
+            with self.subTest(message=msg_name, key=label):
+                self.assertEqual(
+                    expected_hmac(key_for[label], KB_MESSAGES[msg_name]),
+                    tag)
+        for msg_name, message in KB_MESSAGES.items():
+            def t(label):
+                return KB_TAGS[(msg_name, label)]
+            with self.subTest(message=msg_name, check="stdlib-relations"):
+                # Zero-padding at or below 64 bytes changes nothing.
+                for padded in self.SHORT_PADDED:
+                    self.assertEqual(expected_hmac(padded, message),
+                                     t("short"))
+                self.assertEqual(expected_hmac(KB_KEY64, message), t("k63"))
+                self.assertEqual(expected_hmac(KB_ZERO64, message),
+                                 t("zero"))
+                # Past 64 bytes the key authenticates as its digest.
+                self.assertEqual(expected_hmac(KB_KEY65_DIGEST, message),
+                                 t("k65"))
+                self.assertEqual(expected_hmac(KB_LONG_DIGEST, message),
+                                 t("long"))
+                # And the selected data really separates the sides of
+                # every boundary the suite pins.
+                self.assertNotEqual(t("k63"), t("k65"))
+                self.assertNotEqual(t("k63"), t("k64digest"))
+                self.assertNotEqual(t("zero"), t("zero65"))
+                self.assertNotEqual(
+                    t("long"),
+                    expected_hmac(KB_LONG_DIGEST.encode().hex(), message))
+
+    # -- zero padding at or below the block size -----------------------------
+
+    def test_121_trailing_zero_bytes_up_to_block_size_same_tag(self):
+        """The 20-byte key and its zero-padded forms of 21, 32, 63 and 64
+        decoded bytes all produce the independently computed tag -- on the
+        empty message and on the NUL-containing message alike."""
+        for msg_name in KB_MESSAGES:
+            for padded in self.SHORT_PADDED:
+                n = len(bytes.fromhex(padded))
+                with self.subTest(message=msg_name, key_bytes=n):
+                    self.assertLessEqual(n, 64)
+                    self.assertTagSuccess(
+                        self.run_tag(padded, msg_name),
+                        KB_TAGS[(msg_name, "short")],
+                        f"{msg_name}/{n}B")
+
+    def test_122_boundary_63_padded_to_64_but_not_65(self):
+        """The 63-byte key and its one-zero-byte padding to exactly 64
+        bytes share one tag; padding further to 65 bytes crosses the block
+        size and yields the different, standard long-key tag."""
+        for msg_name in KB_MESSAGES:
+            with self.subTest(message=msg_name):
+                expected = KB_TAGS[(msg_name, "k63")]
+                self.assertTagSuccess(
+                    self.run_tag(KB_KEY63, msg_name), expected, "63B")
+                self.assertTagSuccess(
+                    self.run_tag(KB_KEY64, msg_name), expected, "64B")
+                self.assertTagSuccess(
+                    self.run_tag(KB_KEY65, msg_name),
+                    KB_TAGS[(msg_name, "k65")], "65B")
+
+    def test_123_padded_keys_cross_verify_one_tag(self):
+        """Every padded form of each short key verifies the shared tag:
+        exit 0, exactly 'OK\\n', empty stderr."""
+        for msg_name in KB_MESSAGES:
+            short_tag = KB_TAGS[(msg_name, "short")]
+            for padded in self.SHORT_PADDED:
+                n = len(bytes.fromhex(padded))
+                with self.subTest(message=msg_name, key_bytes=n):
+                    self.assertVerifyOk(
+                        self.run_verify(padded, msg_name, short_tag),
+                        f"{msg_name}/{n}B")
+            boundary_tag = KB_TAGS[(msg_name, "k63")]
+            for key in (KB_KEY63, KB_KEY64):
+                n = len(bytes.fromhex(key))
+                with self.subTest(message=msg_name, key_bytes=n):
+                    self.assertVerifyOk(
+                        self.run_verify(key, msg_name, boundary_tag),
+                        f"{msg_name}/{n}B")
+
+    # -- crossing the block size ---------------------------------------------
+
+    def test_124_crossing_boundary_lands_on_standard_long_key(self):
+        """The 65-byte key authenticates exactly like its SHA-256 digest
+        used as a 32-byte key (they cross-verify), and is NOT equivalent
+        to the 63/64-byte key it was padded from: the original tag is a
+        plain mismatch for it, in both directions."""
+        for msg_name in KB_MESSAGES:
+            inner_tag = KB_TAGS[(msg_name, "k63")]
+            outer_tag = KB_TAGS[(msg_name, "k65")]
+            with self.subTest(message=msg_name, check="digest-equivalence"):
+                self.assertTagSuccess(
+                    self.run_tag(KB_KEY65_DIGEST, msg_name), outer_tag,
+                    "digest of 65B key")
+                self.assertVerifyOk(
+                    self.run_verify(KB_KEY65, msg_name, outer_tag), "65B")
+                self.assertVerifyOk(
+                    self.run_verify(KB_KEY65_DIGEST, msg_name, outer_tag),
+                    "digest of 65B key")
+            with self.subTest(message=msg_name, check="65B vs inner tag"):
+                self.assertMismatch(
+                    self.run_verify(KB_KEY65, msg_name, inner_tag),
+                    KB_KEY65, inner_tag, "65B key, 63B tag")
+            with self.subTest(message=msg_name, check="63B vs outer tag"):
+                self.assertMismatch(
+                    self.run_verify(KB_KEY63, msg_name, outer_tag),
+                    KB_KEY63, outer_tag, "63B key, 65B tag")
+
+    def test_125_exact_block_size_key_differs_from_its_digest(self):
+        """A key of exactly 64 bytes is used as-is: its tag differs from
+        the tag of its own SHA-256 digest used as a key, and each side
+        rejects the other's tag as a plain mismatch."""
+        for msg_name in KB_MESSAGES:
+            as_is_tag = KB_TAGS[(msg_name, "k63")]  # 64B key used as-is
+            digest_tag = KB_TAGS[(msg_name, "k64digest")]
+            with self.subTest(message=msg_name):
+                self.assertTagSuccess(
+                    self.run_tag(KB_KEY64_DIGEST, msg_name), digest_tag,
+                    "digest of 64B key")
+                self.assertMismatch(
+                    self.run_verify(KB_KEY64, msg_name, digest_tag),
+                    KB_KEY64, digest_tag, "64B key, digest tag")
+                self.assertMismatch(
+                    self.run_verify(KB_KEY64_DIGEST, msg_name, as_is_tag),
+                    KB_KEY64_DIGEST, as_is_tag, "digest key, 64B tag")
+
+    def test_126_overlong_key_matches_its_digest_key(self):
+        """A 100-byte key is hashed before use: it produces the same
+        independently computed tag as its SHA-256 digest supplied as a
+        32-byte key, and the two forms cross-verify that tag."""
+        for msg_name in KB_MESSAGES:
+            tag = KB_TAGS[(msg_name, "long")]
+            with self.subTest(message=msg_name):
+                self.assertTagSuccess(
+                    self.run_tag(KB_LONG, msg_name), tag, "100B key")
+                self.assertTagSuccess(
+                    self.run_tag(KB_LONG_DIGEST, msg_name), tag,
+                    "digest of 100B key")
+                self.assertVerifyOk(
+                    self.run_verify(KB_LONG, msg_name, tag), "100B key")
+                self.assertVerifyOk(
+                    self.run_verify(KB_LONG_DIGEST, msg_name, tag),
+                    "digest of 100B key")
+
+    def test_127_digest_key_is_raw_bytes_not_hex_text(self):
+        """The digest is supplied as the hex of its raw 32 bytes. Using
+        the digest's 64 hex *characters* as a 64-byte key instead is a
+        different, perfectly legal key: it yields its own independently
+        computed tag and does not verify the over-long key's tag."""
+        for msg_name, message in KB_MESSAGES.items():
+            text_key = KB_LONG_DIGEST.encode().hex()  # 64 ASCII bytes
+            with self.subTest(message=msg_name):
+                self.assertEqual(len(bytes.fromhex(text_key)), 64)
+                self.assertTagSuccess(
+                    self.run_tag(text_key, msg_name),
+                    expected_hmac(text_key, message), "digest text as key")
+                self.assertMismatch(
+                    self.run_verify(text_key, msg_name,
+                                    KB_TAGS[(msg_name, "long")]),
+                    text_key, KB_TAGS[(msg_name, "long")],
+                    "digest-text key vs long-key tag")
+
+    # -- zero-byte keys and the empty key ------------------------------------
+
+    def test_128_zero_byte_keys_and_empty_key(self):
+        """A key of zero bytes only still follows the same rules: one zero
+        byte and 64 zero bytes share a tag (and cross-verify), 65 zero
+        bytes are hashed to a different standard tag -- while the EMPTY
+        key stays a parameter error (exit 2) for both commands and is
+        never rescued by the zero-padding relation."""
+        for msg_name in KB_MESSAGES:
+            zero_tag = KB_TAGS[(msg_name, "zero")]
+            with self.subTest(message=msg_name):
+                self.assertTagSuccess(
+                    self.run_tag(KB_ZERO1, msg_name), zero_tag, "1 zero")
+                self.assertTagSuccess(
+                    self.run_tag(KB_ZERO64, msg_name), zero_tag, "64 zeros")
+                self.assertVerifyOk(
+                    self.run_verify(KB_ZERO64, msg_name, zero_tag),
+                    "64 zeros")
+                self.assertTagSuccess(
+                    self.run_tag(KB_ZERO65, msg_name),
+                    KB_TAGS[(msg_name, "zero65")], "65 zeros")
+                self.assertMismatch(
+                    self.run_verify(KB_ZERO65, msg_name, zero_tag),
+                    KB_ZERO65, zero_tag, "65 zeros vs 64-zero tag")
+        for argv in (
+            [self.exe, "tag", "--key-hex", "",
+             "--file", self.msg_file("empty")],
+            [self.exe, "verify", "--key-hex", "",
+             "--file", self.msg_file("empty"),
+             "--tag-hex", KB_TAGS[("empty", "zero")]],
+        ):
+            with self.subTest(command=argv[1], check="empty-key"):
+                r = subprocess.run(argv, capture_output=True)
+                self.assertEqual(r.returncode, 2,
+                                 f"{argv[1]}: empty key must be a "
+                                 f"parameter error, got {r.returncode}; "
+                                 f"stderr={r.stderr!r}")
+                self.assertEqual(r.stdout, b"")
+                self.assertIn(USAGE_MARKER, r.stderr)
+
+    # -- the same bytes from standard input ----------------------------------
+
+    def test_129_stdin_matches_file_for_boundary_keys(self):
+        """Every boundary relation reproduces when the same message bytes
+        arrive on standard input instead of a file: identical independently
+        computed tags, OK for equivalent keys, mismatch across the
+        boundary."""
+        cases = [
+            (KB_SHORT, "short"), (self.SHORT_PADDED[-1], "short"),
+            (KB_KEY63, "k63"), (KB_KEY64, "k63"),
+            (KB_KEY65, "k65"), (KB_KEY65_DIGEST, "k65"),
+            (KB_KEY64_DIGEST, "k64digest"),
+            (KB_LONG, "long"), (KB_LONG_DIGEST, "long"),
+            (KB_ZERO1, "zero"), (KB_ZERO64, "zero"), (KB_ZERO65, "zero65"),
+        ]
+        for msg_name in KB_MESSAGES:
+            for key_hex, label in cases:
+                n = len(bytes.fromhex(key_hex))
+                with self.subTest(message=msg_name, key=label, key_bytes=n):
+                    self.assertTagSuccess(
+                        self.run_tag_stdin(key_hex, msg_name),
+                        KB_TAGS[(msg_name, label)], f"{msg_name}/{label}")
+        for msg_name in KB_MESSAGES:
+            with self.subTest(message=msg_name, check="verify-stdin"):
+                self.assertVerifyOk(self.run_verify_stdin(
+                    KB_KEY64, msg_name, KB_TAGS[(msg_name, "k63")]),
+                    "64B padded form")
+                self.assertVerifyOk(self.run_verify_stdin(
+                    KB_LONG_DIGEST, msg_name, KB_TAGS[(msg_name, "long")]),
+                    "digest of 100B key")
+                self.assertMismatch(
+                    self.run_verify_stdin(KB_KEY65, msg_name,
+                                          KB_TAGS[(msg_name, "k63")]),
+                    KB_KEY65, KB_TAGS[(msg_name, "k63")],
+                    "65B key vs inner tag")
+
+
 def main():
     if len(sys.argv) not in (2, 3, 4):
         print("usage: regression_test.py /path/to/messagetag "
@@ -2543,6 +3018,8 @@ def main():
     StdinRegression.exe = TagRegression.exe
     StdinRegression.tmpdir = None
     StdinRegression.shim_path = TagRegression.shim_path
+    KeyBoundaryRegression.exe = TagRegression.exe
+    KeyBoundaryRegression.tmpdir = None
     argv = [sys.argv[0], "-v"]
     # unittest's TextTestRunner gives non-zero exit when a test fails.
     loader = unittest.defaultTestLoader
@@ -2550,6 +3027,7 @@ def main():
         loader.loadTestsFromTestCase(TagRegression),
         loader.loadTestsFromTestCase(VerifyRegression),
         loader.loadTestsFromTestCase(StdinRegression),
+        loader.loadTestsFromTestCase(KeyBoundaryRegression),
     ])
     result = unittest.TextTestRunner(verbosity=2).run(suite)
     return 0 if result.wasSuccessful() else 1
